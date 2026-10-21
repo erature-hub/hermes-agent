@@ -27,6 +27,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli import kanban_quota_gate as _kbg
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -142,6 +143,15 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    quota_deferred: list[str] = field(default_factory=list)
+    """Task ids left in ``ready`` because the fleet's weekly cloud-token spend
+    is past the trip ratio (``hermes_cli.kanban_quota_gate``). Deferred, not
+    failed: the card keeps its place and claims as soon as the quota week rolls
+    over (or the allowance is raised). NOT operator-actionable."""
+    quota_state: Optional[str] = None
+    """Fleet quota gate state for this tick: ``"ok"`` / ``"warn"`` /
+    ``"tripped"`` / ``"unknown"`` (fail-open), or ``None`` when the gate is
+    switched off (``HERMES_FLEET_QUOTA_GATE=0``)."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -163,6 +173,7 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    quota_state: Optional[str] = None
     for res in results:
         if res is None:
             continue
@@ -170,13 +181,22 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.quota_deferred:
+            # ``quota_deferred=N`` plus the state below explains the "stuck
+            # queue" every tick of a throttled week — the queue is not stuck,
+            # the fleet is pacing itself.
+            counts["quota_deferred"] = counts.get("quota_deferred", 0) + len(res.quota_deferred)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.quota_state:
+            quota_state = res.quota_state
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
+    if quota_state:
+        parts.append(f"quota_state={quota_state}")
     return ", ".join(parts)
 
 
@@ -2064,6 +2084,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    quota: Optional[_kbg.QuotaReading] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2098,6 +2119,45 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # Fleet weekly cloud-quota gate (card t_074cc4fc): the fleet spends the
+    # provider's weekly allowance that interactive traffic also draws on, and it
+    # 429'd the whole account once (2026-10-18). Past the trip ratio, hold the
+    # claim — the card keeps its place in `ready`, nothing is killed, and the
+    # DECISION lane (priority >= allow_priority) always passes so Paul's own
+    # work is never queued behind the fleet's bulk.
+    if quota is not None and quota.blocks_claim(row["priority"]):
+        result.quota_deferred.append(task_id)
+        if not dry_run:
+            # One event per deferral streak, not one per tick. Dedupe on the
+            # STABLE key (state + quota week) — never on the whole payload:
+            # `used_tokens` moves on nearly every tick of a throttled week
+            # (in-flight workers plus interactive traffic), and comparing it
+            # re-emitted the event roughly once a minute for the rest of the
+            # week. `used_tokens` stays in the payload as the spend reading at
+            # the start of the streak.
+            payload = {
+                "week_start": quota.week_start,
+                "used_tokens": quota.used_tokens,
+                "state": quota.state,
+            }
+            try:
+                with _kb.write_txn(conn):
+                    last = conn.execute(
+                        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                    already_recorded = (
+                        last is not None
+                        and last["kind"] == "claim_deferred_quota"
+                        and _kbg.stored_defer_event_key(last["payload"]) == quota.defer_event_key()
+                    )
+                    if not already_recorded:
+                        _kb._append_event(conn, task_id, "claim_deferred_quota", payload)
+            except Exception:
+                _kb._log.debug(
+                    "kanban dispatch: failed to record claim_deferred_quota for %s",
+                    task_id, exc_info=True,
+                )
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2295,9 +2355,13 @@ def _tick_spawn_budget(
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed rows of one lane in dispatch order.
+
+    ``priority`` rides along for the fleet quota gate, which lets the DECISION
+    lane (high priority) claim even while the fleet is throttled.
+    """
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, priority FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2309,14 +2373,16 @@ def _any_spawnable_review(
     *,
     per_profile_cap: Optional[int] = None,
     per_profile_running: Optional[dict[str, int]] = None,
+    quota: Optional[_kbg.QuotaReading] = None,
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
     Unavailable profile metadata retains the historic fail-open behavior. A
     review row that :func:`_dispatch_lane_task` would refuse this tick — its
-    assignee already at the per-profile cap, or respawn-guarded — cannot
-    consume the reservation, so it must not withhold capacity from an
-    otherwise ready task (one such row would pin ``ready_budget`` to 0).
+    assignee already at the per-profile cap, respawn-guarded, or deferred by the
+    fleet quota gate — cannot consume the reservation, so it must not withhold
+    capacity from an otherwise ready task (one such row would pin
+    ``ready_budget`` to 0).
     """
     if not review_rows:
         return False
@@ -2329,6 +2395,8 @@ def _any_spawnable_review(
         if profile_exists is not None and not profile_exists(assignee):
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
+            continue
+        if quota is not None and quota.blocks_claim(row["priority"]):
             continue
         if check_respawn_guard(conn, row["id"], lane="review") is None:
             return True
@@ -2384,6 +2452,14 @@ def _dispatch_once_locked(
     if not may_spawn:
         return result
 
+    # Fleet weekly cloud-quota gate (card t_074cc4fc). Evaluated ONCE per tick
+    # (the ledgers are shared, the budget is fleet-wide) and then consulted per
+    # row so the DECISION lane can still claim. A dry run reports the state
+    # without announcing a transition or touching the alert bookkeeping.
+    quota = _kbg.tick(announce_transition=not dry_run)
+    if quota is not None:
+        result.quota_state = quota.state
+
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
@@ -2416,12 +2492,14 @@ def _dispatch_once_locked(
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        quota=quota,
     ):
         ready_budget = max(spawn_budget - 1, 0)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        quota=quota,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
