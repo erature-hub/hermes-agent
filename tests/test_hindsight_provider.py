@@ -1197,3 +1197,219 @@ class TestAsyncRetainOperations:
         provider.sync_turn("user", "assistant")
         provider.shutdown()
         assert not provider._pending_ops
+
+
+# ===========================================================================
+# Regression: the commencement recall must actually REACH the turn
+# ===========================================================================
+
+
+class TestCommencementRecallReachesTheTurn:
+    """The provider exists to remove session amnesia.
+
+    Three defects let an agent start blind even though the provider was
+    configured, credentialed and connected. Each is pinned here.
+
+    1. ``prefetch()`` read the staging slot without waiting for the in-flight
+       recall, so the context landed AFTER the turn that needed it. Measured
+       against the live substrate, a recall against the shared 13k-fact bank
+       takes ~5.8s, so every turn got EMPTY context.
+    2. A query that arrived while a recall was in flight was DROPPED: the
+       in-flight recall kept its ORIGINAL query and the newer question was
+       never asked of the substrate.
+    3. ``identity_signature()`` raised under a multiplexed gateway, so the
+       gateway's cache-bust signature collapsed to ``{}`` and a namespace
+       change stopped rebuilding the agent.
+    """
+
+    def test_prefetch_waits_for_the_in_flight_recall(self, monkeypatch):
+        """A recall still in flight must be joined, not ignored.
+
+        The recall is slow (seconds against the live substrate), so the turn
+        boundary always arrives first. Without the join the agent starts blind.
+        """
+        transport = _transport()
+        provider = _provider(monkeypatch, transport)
+        release = threading.Event()
+
+        def slow_recall(m, b, p, q):
+            # The substrate is slow: the turn boundary arrives mid-recall.
+            release.wait(timeout=5)
+            return {"results": [{"id": "f1", "text": "Paul prefers concise bullet summaries."}]}
+
+        transport.routes["POST /v1/default/banks/{bank}/memories/recall"] = slow_recall
+
+        provider._request_recall("what does Paul prefer?")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if any(c["path"].endswith("/memories/recall") for c in transport.calls):
+                break
+            time.sleep(0.01)
+        assert any(c["path"].endswith("/memories/recall") for c in transport.calls)
+
+        # The turn boundary: the recall has NOT finished yet.
+        release.set()
+        text = provider.prefetch("what does Paul prefer?")
+        assert "Paul prefers concise bullet summaries." in text
+
+    def test_prefetch_returns_empty_when_the_recall_never_lands(self, monkeypatch):
+        """A dead substrate must not hang the turn: it yields no context."""
+        def dead(m, b, p, q):
+            raise urllib.error.URLError("connection refused")
+
+        transport = _transport()
+        transport.routes["POST /v1/default/banks/{bank}/memories/recall"] = dead
+        transport.routes["GET /v1/default/banks/{bank}/directives"] = dead
+        provider = _provider(monkeypatch, transport)
+        provider._request_recall("q")
+        started = time.perf_counter()
+        assert provider.prefetch("q") == ""
+        assert time.perf_counter() - started < 30.0
+
+    def test_the_prefetch_budget_is_bounded(self, monkeypatch):
+        """The wait must be bounded by the configured budget, not unbounded."""
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        (home / PROVIDER_NAME / "config.json").write_text(
+            json.dumps({"prefetch_timeout": 0.25}), encoding="utf-8"
+        )
+
+        def slow_recall(m, b, p, q):
+            time.sleep(5)
+            return {"results": []}
+
+        transport = _transport()
+        transport.routes["POST /v1/default/banks/{bank}/memories/recall"] = slow_recall
+        provider = _provider(monkeypatch, transport)
+        provider._request_recall("q")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if any(c["path"].endswith("/memories/recall") for c in transport.calls):
+                break
+            time.sleep(0.01)
+
+        started = time.perf_counter()
+        assert provider.prefetch("q") == ""
+        elapsed = time.perf_counter() - started
+        # The budget is 0.25s: the wait ends near it, nowhere near the 5s recall.
+        assert elapsed < 3.0, f"prefetch waited {elapsed:.1f}s, past its budget"
+
+    def test_a_new_query_is_not_dropped_while_a_recall_is_in_flight(self, monkeypatch):
+        """The newest question must reach the substrate.
+
+        The single-slot worker used to DISCARD a query that arrived while a
+        recall was running, so the context that eventually landed answered the
+        wrong question.
+        """
+        transport = _transport()
+        provider = _provider(monkeypatch, transport)
+        release = threading.Event()
+        served: list[str] = []
+
+        def slow_recall(m, b, p, q):
+            served.append((b or {}).get("query", ""))
+            release.wait(timeout=5)
+            return {"results": [{"id": "f1", "text": "ok"}]}
+
+        transport.routes["POST /v1/default/banks/{bank}/memories/recall"] = slow_recall
+
+        provider._request_recall("the OLD question")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if served:
+                break
+            time.sleep(0.01)
+        assert served == ["the OLD question"]
+
+        # The newer question arrives while the old recall is still running.
+        provider._request_recall("the NEW question")
+        release.set()
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if "the NEW question" in served:
+                break
+            time.sleep(0.01)
+        assert "the NEW question" in served, "the newest query was dropped"
+
+    def test_the_signature_survives_an_unscoped_multiplexed_gateway(self, monkeypatch):
+        """identity_signature() must never raise on the gateway's hot path.
+
+        The gateway calls it on an UNINITIALIZED instance on EVERY inbound
+        message, outside any secret scope. It raised UnscopedSecretError there,
+        the gateway swallowed it, and the cache-bust signature collapsed to {}
+        -- so a namespace change stopped rebuilding the agent and the agent
+        kept using the OLD bank.
+        """
+        from agent.secret_scope import UnscopedSecretError
+
+        def raising_get_secret(name, default=None):
+            raise UnscopedSecretError(name, "no scope installed")
+
+        monkeypatch.setattr(_provider_mod, "get_secret", raising_get_secret)
+
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        (home / PROVIDER_NAME / "config.json").write_text(
+            json.dumps({"namespace": "erature/paul"}), encoding="utf-8"
+        )
+
+        signature = HindsightMemoryProvider().identity_signature()
+        assert signature["hermes_memory_hindsight.namespace"] == "erature/paul"
+        assert signature["hermes_memory_hindsight.base_url"]
+
+    def test_a_gateway_scope_error_does_not_empty_the_cache_bust_signature(self, monkeypatch):
+        """The gateway's own caller must still receive a usable signature."""
+        from agent.secret_scope import UnscopedSecretError
+
+        def raising_get_secret(name, default=None):
+            raise UnscopedSecretError(name, "no scope installed")
+
+        monkeypatch.setattr(_provider_mod, "get_secret", raising_get_secret)
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        (home / PROVIDER_NAME / "config.json").write_text(
+            json.dumps({"namespace": "hermes"}), encoding="utf-8"
+        )
+        signature = HindsightMemoryProvider().identity_signature()
+        assert signature, "an empty signature silently disables cache-busting"
+
+    def test_the_config_file_key_is_used_when_the_env_store_is_unavailable(self, monkeypatch):
+        """A key in the provider's own config file must survive an unscoped read.
+
+        ``get_secret`` raises (rather than returning empty) when multiplexing is
+        active and no scope is installed. The config-file fallback therefore
+        never ran, and the provider reported itself unconfigured -- which
+        ``agent_init`` treats as "drop the provider", so the session silently
+        lost external memory.
+        """
+        from agent.secret_scope import UnscopedSecretError
+
+        def raising_get_secret(name, default=None):
+            raise UnscopedSecretError(name, "no scope installed")
+
+        monkeypatch.setattr(_provider_mod, "get_secret", raising_get_secret)
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        (home / PROVIDER_NAME / "config.json").write_text(
+            json.dumps({"api_key": "file-scoped-key"}), encoding="utf-8"
+        )
+        provider = HindsightMemoryProvider()
+        assert provider.is_available() is True
+        assert provider._resolve_api_key() == "file-scoped-key"
+
+    def test_initialize_survives_an_unscoped_secret_read(self, monkeypatch):
+        """initialize() must not raise out of the provider."""
+        from agent.secret_scope import UnscopedSecretError
+
+        def raising_get_secret(name, default=None):
+            raise UnscopedSecretError(name, "no scope installed")
+
+        monkeypatch.setattr(_provider_mod, "get_secret", raising_get_secret)
+        transport = _transport()
+        _bind_transport(monkeypatch, transport)
+        provider = HindsightMemoryProvider()
+        # No credential is resolvable here, so the provider stays inert -- but it
+        # must NOT raise.
+        provider.initialize("sess-1", hermes_home=str(Path(os.environ["HERMES_HOME"])))
+        assert provider._client is None

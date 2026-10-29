@@ -38,7 +38,7 @@ from agent.memory_provider import (
     RecallStatus,
     spawn_context_thread,
 )
-from agent.secret_scope import get_secret
+from agent.secret_scope import UnscopedSecretError, get_secret
 
 from ._client import (
     DEFAULT_BASE_URL,
@@ -58,8 +58,19 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_NAME = "hermes-memory-hindsight"
 
-#: How long a background recall may run before it is abandoned for this turn.
-PREFETCH_TIMEOUT = 12.0
+#: How long ``prefetch()`` waits for an in-flight background recall to land before
+#: giving up and letting the turn proceed without it. Bounded so a slow or dead
+#: substrate costs latency, never a hang.
+#:
+#: The budget must cover the substrate's own recall latency or the wait is
+#: wasted: measured against the live substrate, a recall against the SHARED
+#: 13k-fact bank takes ~5.8s (budget=mid), while a per-owner bank answers in
+#: ~0.2s. It must also stay under the memory manager's external-prefetch
+#: ceiling (``_EXTERNAL_PREFETCH_TIMEOUT_S`` = 8s), or the manager abandons the
+#: call before the provider returns and the context is lost anyway.
+#:
+#: Overridable per profile with the ``prefetch_timeout`` config key.
+PREFETCH_TIMEOUT = 7.0
 #: How long a background recall waits for an in-flight async retain to become
 #: recall-visible. The wait is in the BACKGROUND, so it costs latency, never the
 #: reply; the bound keeps a stuck operation from taxing every later recall.
@@ -157,6 +168,31 @@ def _load_config() -> dict[str, Any]:
     return cfg
 
 
+def _safe_secret(name: str, default: str = "") -> str:
+    """``get_secret`` that degrades to *default* instead of raising.
+
+    Under a multiplexed gateway, ``get_secret`` fails CLOSED: with no profile
+    secret scope installed it raises ``UnscopedSecretError`` rather than handing
+    back another profile's value. That is the correct posture for a CREDENTIAL.
+
+    It is the wrong posture for a read on the gateway's hot path. The gateway
+    calls ``identity_signature()`` on an UNINITIALIZED instance on EVERY inbound
+    message, outside any scope; an exception there is swallowed by the caller
+    and the cache-bust signature collapses to ``{}`` -- so a namespace or
+    substrate change silently stops rebuilding the agent, and the agent keeps
+    using the OLD bank. The community ``hindsight`` plugin solves this the same
+    way: a narrow helper that catches the scope error and returns the default.
+
+    Only used for NON-secret settings (a base URL). Credentials keep using bare
+    ``get_secret`` so they still fail closed.
+    """
+    try:
+        value = get_secret(name, default)
+    except UnscopedSecretError:
+        return default
+    return default if value is None else value
+
+
 def _schema(name: str, description: str, properties: dict[str, Any] | None = None,
             required: tuple = ()) -> dict[str, Any]:
     return {
@@ -228,6 +264,14 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_count: int = 0
         self._prefetch_stamp: float = 0.0
         self._recall_thread: Optional[threading.Thread] = None
+        # The newest query a recall was requested for. A request that arrives
+        # while a recall is in flight is RECORDED here (not dropped) and served
+        # by the worker when it finishes, so the context that lands matches the
+        # question the user actually asked.
+        self._recall_query: str = ""
+        # The query the worker last served, so an identical re-request is not
+        # served twice in a row (which would spin the worker).
+        self._served_query: str = ""
         self._turn_history: list[dict[str, str]] = []
         self._session_ended = False
         self._shutdown = False
@@ -271,7 +315,18 @@ class HindsightMemoryProvider(MemoryProvider):
         silently loses external memory (the community ``hindsight`` plugin reads its
         own config the same way).
         """
-        key = get_secret("HINDSIGHT_API_KEY", "") or ""
+        key = ""
+        try:
+            key = get_secret("HINDSIGHT_API_KEY", "") or ""
+        except UnscopedSecretError:
+            # No profile scope is installed (the multiplexed gateway reads this
+            # path outside a scope). The env store is UNAVAILABLE here, not
+            # empty, so fall through to the provider's own config file rather
+            # than reporting the provider unconfigured -- a hand-edited or
+            # Dashboard-written key must still be honored. The config file is
+            # profile-scoped (it lives under the profile's HERMES_HOME), so this
+            # cannot leak another profile's credential.
+            key = ""
         if key.strip():
             return key.strip()
         try:
@@ -358,12 +413,12 @@ class HindsightMemoryProvider(MemoryProvider):
 
         cfg = _load_config()
         self._base_url = str(
-            get_secret("HINDSIGHT_API_URL", "") or cfg.get("base_url") or DEFAULT_BASE_URL
+            _safe_secret("HINDSIGHT_API_URL", "") or cfg.get("base_url") or DEFAULT_BASE_URL
         ).rstrip("/")
         self._api_key = self._resolve_api_key()
         try:
             self._timeout = float(
-                get_secret("HINDSIGHT_TIMEOUT", "") or cfg.get("timeout") or DEFAULT_TIMEOUT
+                _safe_secret("HINDSIGHT_TIMEOUT", "") or cfg.get("timeout") or DEFAULT_TIMEOUT
             )
         except (TypeError, ValueError):
             self._timeout = DEFAULT_TIMEOUT
@@ -399,7 +454,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._namespace,
             self._base_url,
         )
-        self._start_commencement_recall()
+        self._request_recall()
 
     def shutdown(self) -> None:
         self._shutdown = True
@@ -415,25 +470,68 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # -- commencement recall ----------------------------------------------------
 
-    def _start_commencement_recall(self, query: str = "") -> None:
-        """Kick a background recall so the NEXT turn starts with context.
+    def _request_recall(self, query: str = "") -> None:
+        """Request a background recall for *query* (newest request wins).
 
-        This is the "commencement" hook: it fires at session start (before the user has
-        said anything meaningful) and again at each turn boundary. It is deliberately
-        background — the substrate may be slow, and a slow substrate must never stall a
-        turn.
+        A recall takes seconds (the shared 13k-fact bank answers in ~5-7s), so
+        a request that arrives while one is in flight used to be DROPPED
+        outright: the in-flight recall kept its ORIGINAL query and the newer
+        question was never asked of the substrate. The request is therefore
+        RECORDED, not discarded -- the worker picks up the newest query when it
+        finishes, so the context that lands matches what the user last asked.
+
+        Only one worker runs at a time (the substrate is the scarce resource),
+        so a burst of turns produces a short queue of queries, not a pile of
+        threads.
         """
         if self._client is None or self._shutdown:
             return
-        with self._lock:
-            if self._recall_thread is not None and self._recall_thread.is_alive():
-                return
         search = query.strip() or self._commencement_query()
-        thread = spawn_context_thread(
-            self._run_recall, name="hindsight-commencement-recall", kwargs={"query": search}
+        with self._lock:
+            self._recall_query = search
+            thread = self._recall_thread
+            if thread is not None and thread.is_alive():
+                # A worker is already running; it will pick up the new query.
+                return
+        worker = spawn_context_thread(
+            self._run_recall_worker, name="hindsight-commencement-recall"
         )
-        self._recall_thread = thread
-        thread.start()
+        with self._lock:
+            self._recall_thread = worker
+        worker.start()
+
+    def _run_recall_worker(self) -> None:
+        """Recall worker: process the newest requested query, then any newer one.
+
+        Each pass reads the newest query at the moment it starts, so a query
+        that arrived during the previous pass is served next rather than lost.
+
+        A pass whose query is identical to the one just served does NOT re-run
+        it: ``prefetch()`` re-arms the query when nothing landed, and without
+        this guard that would spin the worker in a tight loop against the
+        substrate. The query is left pending instead, so the SAME question can
+        still be asked again later.
+        """
+        with self._lock:
+            self._served_query = ""
+        while not self._shutdown:
+            with self._lock:
+                query = self._recall_query
+                self._recall_query = ""
+                served = self._served_query
+            if not query:
+                return
+            if query == served:
+                with self._lock:
+                    if not self._recall_query:
+                        self._recall_query = query
+                return
+            with self._lock:
+                self._served_query = query
+            self._run_recall(query)
+            with self._lock:
+                if not self._recall_query:
+                    return
 
     def _commencement_query(self) -> str:
         """The query used for the startup recall.
@@ -526,15 +624,71 @@ class HindsightMemoryProvider(MemoryProvider):
         return ""
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return the staged context (fast — the recall already ran in background)."""
+        """Return the staged context, waiting briefly for the recall to land.
+
+        The background recall started at the turn boundary is usually still in
+        flight when this runs (the shared bank answers a recall in ~5-7s), so
+        reading the staging slot alone returned EMPTY on every turn -- the
+        agent started blind, which is the amnesia this provider exists to
+        remove. Joining the in-flight recall for a bounded moment lets the
+        context that is already seconds old actually reach the turn.
+
+        The wait is bounded by ``prefetch_timeout`` and the recall is joined, not
+        re-issued: a slow or dead substrate costs that budget once and the turn
+        still proceeds (with no context) rather than hanging.
+        """
+        text = self._take_staged_context()
+        if not text:
+            self._await_staged_context()
+            text = self._take_staged_context()
+        if not text:
+            # Nothing landed: stage a recall so the NEXT turn has context.
+            self._request_recall(query)
+        return text
+
+    def _take_staged_context(self) -> str:
+        """Consume the staged context under the lock.
+
+        The staged COUNT is left alone: ``recall_status()`` reads it afterwards
+        to report how much was injected (the manager calls ``prefetch_all()``
+        and then ``describe_recall()``), and it is that call which resets it.
+        """
         with self._lock:
             text = self._prefetch_text
             self._prefetch_text = ""
-        if not text:
-            # Nothing staged yet: stage a recall now so the NEXT turn has context.
-            self._start_commencement_recall(query)
-            return ""
         return text
+
+    def _await_staged_context(self) -> None:
+        """Join the in-flight recall for at most the configured budget.
+
+        Bounded on purpose: the turn must never wait on the substrate
+        indefinitely, and the recall continues in the background either way.
+        """
+        thread = self._recall_thread
+        if thread is None or not thread.is_alive():
+            return
+        budget = self._prefetch_timeout()
+        if budget <= 0:
+            return
+        deadline = time.monotonic() + budget
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            thread.join(timeout=min(remaining, 0.05))
+            with self._lock:
+                if self._prefetch_text:
+                    return
+            if not thread.is_alive():
+                return
+
+    def _prefetch_timeout(self) -> float:
+        """The configured join budget for ``prefetch()`` (never negative)."""
+        try:
+            value = float(_load_config().get("prefetch_timeout", PREFETCH_TIMEOUT))
+        except (TypeError, ValueError):
+            value = PREFETCH_TIMEOUT
+        return max(0.0, value)
 
     def recall_status(self) -> Optional[RecallStatus]:
         with self._lock:
@@ -546,13 +700,13 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Stage the next turn's recall in the background."""
-        self._start_commencement_recall(query)
+        self._request_recall(query)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Per-turn tick: refresh the standing context for the upcoming message."""
         if self._shutdown:
             return
-        self._start_commencement_recall(message or "")
+        self._request_recall(message or "")
 
     def on_session_switch(
         self,
@@ -570,7 +724,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._prefetch_text = ""
                 self._prefetch_count = 0
             self._turn_history.clear()
-        self._start_commencement_recall()
+        self._request_recall()
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         """Session boundary: retain the closing context once, then stop."""
@@ -929,7 +1083,7 @@ class HindsightMemoryProvider(MemoryProvider):
             "hermes_memory_hindsight.namespace": namespace,
             "hermes_memory_hindsight.bank": self._bank_id or namespace,
             "hermes_memory_hindsight.base_url": str(
-                cfg.get("base_url") or get_secret("HINDSIGHT_API_URL", "") or DEFAULT_BASE_URL
+                cfg.get("base_url") or _safe_secret("HINDSIGHT_API_URL", "") or DEFAULT_BASE_URL
             ).rstrip("/"),
         }
 
