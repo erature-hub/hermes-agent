@@ -150,6 +150,24 @@ class HindsightClient:
         )
         return payload if isinstance(payload, dict) else {}
 
+    def ensure_bank(self, bank_id: str, *, name: str = "") -> dict[str, Any]:
+        """Create the bank if it does not exist; return its record.
+
+        The substrate has no ``POST /banks`` — ``PUT /banks/{bank_id}`` is the
+        upsert. It is NOT destructive: a field the request omits keeps its current
+        value (verified against the live substrate: re-PUTting a bank preserved its
+        ``mission``), so this is safe to call for a bank that already exists.
+        """
+        body: dict[str, Any] = {}
+        if name:
+            body["name"] = name
+        payload = self._request(
+            "PUT",
+            f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}",
+            body=body,
+        )
+        return payload if isinstance(payload, dict) else {}
+
     # -- memories ---------------------------------------------------------------
 
     def retain(
@@ -160,12 +178,25 @@ class HindsightClient:
         context: str | None = None,
         metadata: Mapping[str, str] | None = None,
         document_id: str | None = None,
+        asynchronous: bool = True,
     ) -> dict[str, Any]:
         """Retain one content item into a bank.
 
         The wire shape is ``{"items": [{content, context?, document_id?}]}`` — the
         substrate's ``RetainRequest`` takes a LIST of items, not a bare ``content``
         field (verified against the live substrate: a bare ``content`` is a 422).
+
+        ``asynchronous=True`` (the default) asks the substrate to extract in the
+        background and return an ``operation_id`` immediately. That matters for the
+        turn path: a SYNCHRONOUS retain waits for extraction to finish, which on the
+        live shared bank (13k facts) measured **2-4s for a normal turn and 9-10s when
+        extraction flaked** — and the substrate answers a flaky extraction with a
+        **500**, losing the fact entirely. The async path returns in ~24ms, the
+        substrate owns the retry (``retry_count``/``next_retry_at`` on the operation
+        record), and the retained fact still becomes recall-visible.
+
+        Callers that need the fact to be recall-visible immediately should track the
+        returned ``operation_id`` and wait for it (see ``operation_status``).
         """
         item: dict[str, Any] = {"content": content}
         if context:
@@ -174,10 +205,33 @@ class HindsightClient:
             item["document_id"] = document_id
         if metadata:
             item["metadata"] = {str(k): str(v) for k, v in metadata.items()}
+        body: dict[str, Any] = {"items": [item]}
+        if asynchronous:
+            body["async"] = True
         payload = self._request(
             "POST", f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories",
-            body={"items": [item]},
+            body=body,
         )
+        return payload if isinstance(payload, dict) else {}
+
+    def operation_status(self, bank_id: str, operation_id: str) -> dict[str, Any]:
+        """The status record of an async retain operation.
+
+        ``status`` is ``pending``/``processing`` while the substrate extracts, then
+        ``completed`` or ``failed``. An operation the substrate has evicted (404)
+        is reported as ``{"status": "completed"}`` — a missing record is not evidence
+        of a failed write, and treating it as one would retry a write that landed.
+        """
+        try:
+            payload = self._request(
+                "GET",
+                f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}"
+                f"/operations/{urllib.parse.quote(operation_id, safe='')}",
+            )
+        except HindsightError as exc:
+            if getattr(exc, "status", None) == 404:
+                return {"status": "completed"}
+            raise
         return payload if isinstance(payload, dict) else {}
 
     def recall(
@@ -201,11 +255,21 @@ class HindsightClient:
         return []
 
     def delete_memory(self, bank_id: str, memory_id: str) -> dict[str, Any]:
-        """Delete one retained memory by id."""
+        """Retire one retained memory by id (reversible soft-delete).
+
+        The substrate has NO per-memory DELETE route: ``DELETE
+        /v1/default/banks/{bank}/memories/{memory}`` is **405 Method Not Allowed**
+        (verified against the live substrate; the OpenAPI lists only GET and PATCH
+        there). The real per-memory removal is the CURATION route — ``PATCH
+        /memories/{memory_id}`` with ``state="invalidated"``, which excludes the
+        memory from recall, consolidation and graph maintenance while keeping it
+        for audit. That is what this calls.
+        """
         payload = self._request(
-            "DELETE",
+            "PATCH",
             f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories/"
             f"{urllib.parse.quote(memory_id, safe='')}",
+            body={"state": "invalidated", "reason": "removed from Hermes"},
         )
         return payload if isinstance(payload, dict) else {}
 

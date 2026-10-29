@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import re
 import socket
 import sys
@@ -48,6 +49,7 @@ BankResolver = _namespaces_mod.BankResolver
 NamespaceError = _namespaces_mod.NamespaceError
 normalize_namespace = _namespaces_mod.normalize_namespace
 owner_of = _namespaces_mod.owner_of
+owner_bank_id = _namespaces_mod.owner_bank_id
 HindsightMemoryProvider = _provider_mod.HindsightMemoryProvider
 PROVIDER_NAME = _provider_mod.PROVIDER_NAME
 
@@ -91,6 +93,8 @@ class _FakeTransport:
         self._lock = threading.Lock()
         # bank_id -> list of alias dicts
         self.aliases: dict[str, list[dict[str, Any]]] = {}
+        # bank_id -> provisioned bank record (created through PUT /banks/{id})
+        self.banks: dict[str, dict[str, Any]] = {}
         self.directives: list[dict[str, Any]] = []
 
     def add(self, route: str, handler: Any) -> None:
@@ -247,7 +251,11 @@ def _default_routes(transport: _FakeTransport | None = None) -> dict[str, Any]:
                 if part.startswith("q="):
                     needle = urllib.parse.unquote_plus(part[2:])
         rows = []
-        for bank in _BANKS:
+        banks = list(_BANKS) + [
+            {**record, "display_alias": None, "fact_count": 0}
+            for record in transport.banks.values()
+        ]
+        for bank in banks:
             aliases = transport.aliases.get(bank["bank_id"], [{"alias": "hermes", "primary": True}])
             names = [bank["bank_id"], bank.get("name") or "", bank.get("display_alias") or ""]
             names += [a.get("alias", "") for a in aliases]
@@ -282,9 +290,19 @@ def _default_routes(transport: _FakeTransport | None = None) -> dict[str, Any]:
         transport.directives.append(entry)
         return entry
 
+    def put_bank(m, b, p, q):
+        """``PUT /banks/{id}`` is the upsert — the substrate has no POST /banks."""
+        bank_id = _bank_of(p)
+        transport.banks.setdefault(bank_id, {"bank_id": bank_id, "name": "", "aliases": []})
+        record = transport.banks[bank_id]
+        if isinstance(b, dict) and b.get("name"):
+            record["name"] = b["name"]
+        return {"bank_id": bank_id, "name": record.get("name", "")}
+
     return {
         "GET /v1/default/banks": list_banks,
         "GET /v1/default/banks/{bank}": lambda m, b, p, q: {"bank_id": _bank_of(p)},
+        "PUT /v1/default/banks/{bank}": put_bank,
         "GET /v1/default/banks/{bank}/aliases": list_aliases,
         "POST /v1/default/banks/{bank}/aliases": add_alias,
         "POST /v1/default/banks/{bank}/memories": lambda m, b, p, q: {
@@ -350,11 +368,65 @@ class TestBankResolver:
         resolver = BankResolver(_make_client(transport))
         assert resolver.canonical_bank("hermes") == "erature-hermes"
 
-    def test_owner_namespace_falls_back_to_the_shared_bank(self):
-        """An unprovisioned owner namespace must not lose memory silently."""
+    def test_owner_namespace_resolves_to_its_own_bank(self, monkeypatch):
+        """An owner namespace must NOT collapse onto the shared bank.
+
+        Falling back to the shared bank for every owner means one owner's memories
+        are recalled under another owner's namespace — the namespace stops being a
+        boundary. Each owner gets a dedicated bank instead.
+        """
         transport = _transport()
         resolver = BankResolver(_make_client(transport))
-        assert resolver.canonical_bank("erature/paul") == "erature-hermes"
+        canonical = resolver.ensure_namespace("erature/paul")
+        assert canonical != "erature-hermes"
+        assert "/" not in canonical
+        assert canonical == "erature-paul"
+
+    def test_two_owners_get_different_banks(self, monkeypatch):
+        transport = _transport()
+        resolver = BankResolver(_make_client(transport))
+        paul = resolver.ensure_namespace("erature/paul")
+        jane = resolver.ensure_namespace("erature/jane")
+        assert paul != jane
+
+    def test_an_owner_namespace_is_provisioned_as_a_bank(self):
+        """The dedicated bank is created, then the slash form is its alias."""
+        transport = _transport()
+        transport.routes["PUT /v1/default/banks/{bank}"] = (
+            lambda m, b, p, q: {"bank_id": _bank_of(p), "name": "Erature / paul"}
+        )
+        resolver = BankResolver(_make_client(transport))
+        canonical = resolver.ensure_namespace("erature/paul")
+        put_calls = [c for c in transport.calls if c["method"] == "PUT"]
+        assert put_calls, "the dedicated bank was never provisioned"
+        assert canonical in put_calls[0]["path"]
+        alias_calls = [
+            c for c in transport.calls if c["method"] == "POST" and c["path"].endswith("/aliases")
+        ]
+        assert alias_calls
+        assert alias_calls[0]["body"]["alias"] == "erature/paul"
+
+    def test_a_lossy_owner_name_cannot_collide_with_another_owner(self):
+        """``pa ul`` and ``pa-ul`` are different owners and must not share a bank."""
+        assert owner_bank_id("erature/pa ul") != owner_bank_id("erature/pa-ul")
+        assert owner_bank_id("erature/pa-ul") == "erature-pa-ul"
+
+    def test_an_existing_alias_is_reused_not_reprovisioned(self):
+        """An owner namespace provisioned earlier keeps ITS bank."""
+        transport = _transport()
+        transport.banks["erature-paul"] = {"bank_id": "erature-paul", "name": "Erature / paul"}
+        transport.aliases["erature-paul"] = [{"alias": "erature/paul", "primary": False}]
+        resolver = BankResolver(_make_client(transport))
+        canonical = resolver.ensure_namespace("erature/paul")
+        assert canonical == "erature-paul"
+        assert not [c for c in transport.calls if c["method"] == "PUT"]
+
+    def test_the_shared_namespace_is_never_provisioned(self):
+        """``hermes`` addresses the shared bank; it must not create one."""
+        transport = _transport()
+        resolver = BankResolver(_make_client(transport))
+        assert resolver.ensure_namespace("hermes") == "erature-hermes"
+        assert not [c for c in transport.calls if c["method"] == "PUT"]
 
     def test_ensure_namespace_registers_the_slash_form_as_an_alias(self):
         """The slash form cannot be a path segment, so it is provisioned as an alias."""
@@ -439,9 +511,47 @@ class TestClientWireContract:
         transport = _transport()
         _make_client(transport).retain("hermes", "a fact", context="ctx")
         body = transport.calls[-1]["body"]
-        assert list(body) == ["items"]
+        assert list(body) == ["items", "async"]
         assert body["items"][0]["content"] == "a fact"
         assert body["items"][0]["context"] == "ctx"
+
+    def test_retain_is_asynchronous_by_default(self):
+        """The turn path must not block on extraction.
+
+        Measured on the live shared bank (13k facts): a synchronous retain took
+        2-4s for a normal turn and 9-10s when extraction flaked — and a flaky
+        extraction answers 500, losing the fact. The async path returns in ~24ms
+        and the substrate owns the retry, so the write is not lost.
+        """
+        transport = _transport()
+        _make_client(transport).retain("hermes", "a fact")
+        assert transport.calls[-1]["body"]["async"] is True
+
+    def test_retain_can_be_synchronous_on_request(self):
+        """An explicit synchronous retain omits the async flag entirely."""
+        transport = _transport()
+        _make_client(transport).retain("hermes", "a fact", asynchronous=False)
+        body = transport.calls[-1]["body"]
+        assert "async" not in body
+        assert list(body) == ["items"]
+
+    def test_operation_status_reports_the_substrate_record(self):
+        transport = _transport()
+        transport.routes["GET /v1/default/banks/{bank}/operations/{op}"] = (
+            lambda m, b, p, q: {"status": "completed"}
+        )
+        status = _make_client(transport).operation_status("hermes", "op-1")
+        assert status["status"] == "completed"
+        assert transport.calls[-1]["path"].endswith("/operations/op-1")
+
+    def test_operation_status_treats_an_evicted_record_as_complete(self):
+        """A 404 means the substrate no longer tracks the op — not that it failed."""
+        transport = _transport()
+        transport.routes["GET /v1/default/banks/{bank}/operations/{op}"] = (
+            lambda m, b, p, q: (_ for _ in ()).throw(HindsightError("404 gone", status=404))
+        )
+        status = _make_client(transport).operation_status("hermes", "op-1")
+        assert status["status"] == "completed"
 
     def test_recall_posts_query_and_budget(self):
         transport = _transport()
@@ -454,15 +564,24 @@ class TestClientWireContract:
         transport = _transport()
         assert _make_client(transport).reflect("hermes", "q") == "Paul prefers concise summaries."
 
-    def test_delete_memory_targets_the_memory_id(self):
+    def test_delete_memory_retires_the_memory_through_the_curation_route(self):
+        """There is NO per-memory DELETE on the substrate.
+
+        ``DELETE /v1/default/banks/{bank}/memories/{memory}`` answers **405 Method
+        Not Allowed** on the live substrate (the OpenAPI lists only GET and PATCH
+        there). The real per-memory removal is the curation route: PATCH with
+        ``state="invalidated"``, which excludes the memory from recall while
+        keeping it for audit.
+        """
         transport = _transport()
-        transport.routes["DELETE /v1/default/banks/{bank}/memories/{memory}"] = (
-            lambda m, b, p, q: {"deleted": True}
+        transport.routes["PATCH /v1/default/banks/{bank}/memories/{memory}"] = (
+            lambda m, b, p, q: {"id": "mem-123", "state": "invalidated"}
         )
         _make_client(transport).delete_memory("hermes", "mem-123")
         call = transport.calls[-1]
-        assert call["method"] == "DELETE"
+        assert call["method"] == "PATCH"
         assert call["path"].endswith("/memories/mem-123")
+        assert call["body"]["state"] == "invalidated"
 
     def test_http_error_is_raised_with_status(self):
         def boom(m, b, p, q):
@@ -516,6 +635,12 @@ class TestClientWireContract:
 # ===========================================================================
 
 
+def _bank_of(path: str) -> str:
+    """The bank id segment of a substrate path."""
+    parts = path.split("/")
+    return parts[parts.index("banks") + 1] if "banks" in parts else ""
+
+
 def _provider(monkeypatch, transport, **cfg) -> HindsightMemoryProvider:
     """Build a provider bound to a fake transport, without touching the network."""
     provider = HindsightMemoryProvider()
@@ -543,6 +668,35 @@ class TestProviderIdentity:
     def test_availability_is_true_with_a_credential(self, monkeypatch):
         monkeypatch.setenv("HINDSIGHT_API_KEY", "test-key")
         assert HindsightMemoryProvider().is_available() is True
+
+    def test_availability_accepts_a_key_in_the_provider_config(self, monkeypatch):
+        """The declared schema advertises ``api_key``; a value there must be honored.
+
+        The provider's own config file is a first-class secret location: the
+        Dashboard's flat-json storage and the community ``hindsight`` plugin both
+        keep the key there. Reading only the env var made the provider report
+        itself unavailable — and ``agent_init`` then DROPS it, so the session
+        silently loses external memory.
+        """
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        (home / PROVIDER_NAME / "config.json").write_text(
+            json.dumps({"api_key": "file-scoped-key"}), encoding="utf-8"
+        )
+        monkeypatch.delenv("HINDSIGHT_API_KEY", raising=False)
+        provider = HindsightMemoryProvider()
+        assert provider.is_available() is True
+        assert provider._resolve_api_key() == "file-scoped-key"
+
+    def test_the_env_store_wins_over_the_config_file(self, monkeypatch):
+        """A rotated key in the env store must not be shadowed by a stale file value."""
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        (home / PROVIDER_NAME / "config.json").write_text(
+            json.dumps({"api_key": "stale-file-key"}), encoding="utf-8"
+        )
+        monkeypatch.setenv("HINDSIGHT_API_KEY", "fresh-env-key")
+        assert HindsightMemoryProvider()._resolve_api_key() == "fresh-env-key"
 
     def test_tool_schemas_are_declared(self):
         names = {s["name"] for s in HindsightMemoryProvider().get_tool_schemas()}
@@ -913,3 +1067,133 @@ class TestDiscovery:
         assert {"base_url", "namespace", "budget", "commitment"} <= keys
         secret_fields = [f for f in schema.fields if f.is_secret]
         assert secret_fields and secret_fields[0].env_key == "HINDSIGHT_API_KEY"
+
+
+# ===========================================================================
+# Cache-bust identity
+# ===========================================================================
+
+
+class TestIdentitySignature:
+    """The gateway calls ``identity_signature()`` on an UNINITIALIZED instance on
+    every inbound message, to decide whether a cached agent must be rebuilt."""
+
+    def test_the_signature_reflects_the_configured_namespace(self, monkeypatch):
+        """A namespace change must bust the cached agent.
+
+        Reading the instance state here reported the DEFAULT namespace forever
+        (an uninitialized instance still holds it), so the cached agent kept
+        using the old bank after the namespace was changed.
+        """
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        (home / PROVIDER_NAME / "config.json").write_text(
+            json.dumps({"namespace": "erature/paul"}), encoding="utf-8"
+        )
+        signature = HindsightMemoryProvider().identity_signature()
+        assert signature["hermes_memory_hindsight.namespace"] == "erature/paul"
+
+    def test_a_namespace_change_changes_the_signature(self, monkeypatch):
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        config = home / PROVIDER_NAME / "config.json"
+        config.write_text(json.dumps({"namespace": "hermes"}), encoding="utf-8")
+        before = HindsightMemoryProvider().identity_signature()
+        config.write_text(json.dumps({"namespace": "erature/paul"}), encoding="utf-8")
+        after = HindsightMemoryProvider().identity_signature()
+        assert before != after
+
+    def test_the_signature_includes_the_substrate_url(self, monkeypatch):
+        """A different substrate is a different memory: it must bust the cache too."""
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        (home / PROVIDER_NAME / "config.json").write_text(
+            json.dumps({"base_url": "http://other.test:8888"}), encoding="utf-8"
+        )
+        signature = HindsightMemoryProvider().identity_signature()
+        assert signature["hermes_memory_hindsight.base_url"] == "http://other.test:8888"
+
+    def test_the_signature_is_cheap_and_read_only(self, monkeypatch):
+        """The gateway calls this on every inbound message: it must not write."""
+        home = Path(os.environ["HERMES_HOME"])
+        (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
+        config = home / PROVIDER_NAME / "config.json"
+        config.write_text(json.dumps({"namespace": "hermes"}), encoding="utf-8")
+        before = config.read_bytes()
+        HindsightMemoryProvider().identity_signature()
+        assert config.read_bytes() == before
+
+
+# ===========================================================================
+# Async retain operations
+# ===========================================================================
+
+
+class TestAsyncRetainOperations:
+    def test_a_turn_tracks_its_retain_operation(self, monkeypatch):
+        transport = _transport()
+        transport.routes["POST /v1/default/banks/{bank}/memories"] = (
+            lambda m, b, p, q: {"success": True, "operation_id": "op-42"}
+        )
+        provider = _provider(monkeypatch, transport)
+        provider.sync_turn("user", "assistant")
+        assert "op-42" in provider._pending_ops
+
+    def test_a_recall_waits_for_the_pending_write(self, monkeypatch):
+        """A turn retained moments ago must be recall-visible on the next recall."""
+        transport = _transport()
+        transport.routes["POST /v1/default/banks/{bank}/memories"] = (
+            lambda m, b, p, q: {"success": True, "operation_id": "op-7"}
+        )
+        statuses = iter([{"status": "pending"}, {"status": "completed"}])
+        transport.routes["GET /v1/default/banks/{bank}/operations/{op}"] = (
+            lambda m, b, p, q: next(statuses, {"status": "completed"})
+        )
+        provider = _provider(monkeypatch, transport)
+        provider.sync_turn("user", "assistant")
+        provider._run_recall("q")
+        assert not provider._pending_ops
+        assert any(c["path"].endswith("/operations/op-7") for c in transport.calls)
+
+    def test_a_stuck_operation_is_dropped_rather_than_waited_forever(self, monkeypatch):
+        """A pending operation must cost latency, never a hang."""
+        transport = _transport()
+        transport.routes["POST /v1/default/banks/{bank}/memories"] = (
+            lambda m, b, p, q: {"success": True, "operation_id": "op-stuck"}
+        )
+        transport.routes["GET /v1/default/banks/{bank}/operations/{op}"] = (
+            lambda m, b, p, q: {"status": "pending"}
+        )
+        provider = _provider(monkeypatch, transport)
+        provider.sync_turn("user", "assistant")
+        started = time.monotonic()
+        provider._await_pending_ops(0.3)
+        assert time.monotonic() - started < 3.0
+        assert not provider._pending_ops
+
+    def test_a_failed_operation_is_cleared(self, monkeypatch):
+        transport = _transport()
+        transport.routes["POST /v1/default/banks/{bank}/memories"] = (
+            lambda m, b, p, q: {"success": True, "operation_id": "op-failed"}
+        )
+        transport.routes["GET /v1/default/banks/{bank}/operations/{op}"] = (
+            lambda m, b, p, q: {"status": "failed"}
+        )
+        provider = _provider(monkeypatch, transport)
+        provider.sync_turn("user", "assistant")
+        provider._await_pending_ops(2.0)
+        assert not provider._pending_ops
+
+    def test_shutdown_settles_pending_writes(self, monkeypatch):
+        """An accepted-but-unextracted write must not be lost with the process."""
+        transport = _transport()
+        transport.routes["POST /v1/default/banks/{bank}/memories"] = (
+            lambda m, b, p, q: {"success": True, "operation_id": "op-shutdown"}
+        )
+        transport.routes["GET /v1/default/banks/{bank}/operations/{op}"] = (
+            lambda m, b, p, q: {"status": "completed"}
+        )
+        provider = _provider(monkeypatch, transport)
+        provider.sync_turn("user", "assistant")
+        provider.shutdown()
+        assert not provider._pending_ops

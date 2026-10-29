@@ -60,6 +60,10 @@ PROVIDER_NAME = "hermes-memory-hindsight"
 
 #: How long a background recall may run before it is abandoned for this turn.
 PREFETCH_TIMEOUT = 12.0
+#: How long a background recall waits for an in-flight async retain to become
+#: recall-visible. The wait is in the BACKGROUND, so it costs latency, never the
+#: reply; the bound keeps a stuck operation from taxing every later recall.
+RETAIN_SETTLE_TIMEOUT = 5.0
 #: Upper bound on how much recalled text is injected into the prompt.
 MAX_INJECTED_CHARS = 6000
 #: Upper bound on the number of recalled facts injected.
@@ -227,6 +231,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._turn_history: list[dict[str, str]] = []
         self._session_ended = False
         self._shutdown = False
+        # Async retain operations awaiting extraction: the next recall waits for
+        # them so a just-written turn is recall-visible.
+        self._pending_ops: set[str] = set()
 
     # -- identity ---------------------------------------------------------------
 
@@ -251,8 +258,31 @@ class HindsightMemoryProvider(MemoryProvider):
         )
 
     def _resolve_api_key(self) -> str:
+        """The bearer token, from the env store first, then the provider's own config.
+
+        The env store is authoritative: the Dashboard panel and ``hermes memory setup``
+        both persist a submitted secret there (``save_env_value``), and ``get_secret``
+        resolves it through the active profile's scope, so it is the only source that
+        is correct under a multiplexed gateway.
+
+        The config file is the fallback for a hand-edited ``api_key``. The declared
+        schema advertises ``api_key`` as a field, so a value placed there must be
+        honored — otherwise the provider reports itself unconfigured and the session
+        silently loses external memory (the community ``hindsight`` plugin reads its
+        own config the same way).
+        """
         key = get_secret("HINDSIGHT_API_KEY", "") or ""
-        return key.strip()
+        if key.strip():
+            return key.strip()
+        try:
+            cfg = _load_config()
+        except Exception:
+            return ""
+        for field in ("api_key", "apiKey"):
+            value = str(cfg.get(field) or "").strip()
+            if value:
+                return value
+        return ""
 
     # -- configuration ----------------------------------------------------------
 
@@ -376,6 +406,12 @@ class HindsightMemoryProvider(MemoryProvider):
         thread = self._recall_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
+        # An accepted-but-unextracted retain would be lost with the process, so
+        # give the substrate a bounded moment to land it before the session ends.
+        try:
+            self._await_pending_ops(RETAIN_SETTLE_TIMEOUT)
+        except Exception:  # a provider's shutdown must never raise
+            logger.debug("hindsight: retain settle on shutdown failed", exc_info=True)
 
     # -- commencement recall ----------------------------------------------------
 
@@ -417,6 +453,11 @@ class HindsightMemoryProvider(MemoryProvider):
         if client is None:
             return
         try:
+            # A turn retained moments ago is not yet recall-visible (async retain
+            # returns on acceptance). Waiting for it here — in the BACKGROUND, with
+            # a bounded budget — is what makes "the next turn already carries
+            # context" true without ever blocking the reply.
+            self._await_pending_ops(RETAIN_SETTLE_TIMEOUT)
             facts = client.recall(self._bank_id, query, budget=self._budget)
             directives = self._fetch_directives()
         except HindsightError as exc:
@@ -568,6 +609,74 @@ class HindsightMemoryProvider(MemoryProvider):
             return False
         return self._agent_context == "primary"
 
+    def _track_retain(self, result: dict[str, Any]) -> None:
+        """Record the async retain operation so the next recall can wait for it.
+
+        An async retain returns on ACCEPTANCE, not durability: the fact is not
+        recall-visible until the substrate has extracted it. A recall issued right
+        after a turn would otherwise miss that turn. Tracking the operation id lets
+        the recall wait for the write to land, with a bounded budget so a stuck
+        operation costs latency, never a hang.
+        """
+        if not isinstance(result, dict):
+            return
+        ids: list[str] = []
+        single = result.get("operation_id")
+        if single:
+            ids.append(str(single))
+        for extra in result.get("operation_ids") or []:
+            if extra:
+                ids.append(str(extra))
+        if not ids:
+            return
+        with self._lock:
+            self._pending_ops.update(ids)
+
+    def _await_pending_ops(self, timeout: float) -> None:
+        """Wait (bounded) for the tracked retain operations to become recall-visible.
+
+        Never blocks longer than *timeout*: an operation that stays pending is
+        dropped rather than retried forever, because a permanently failing status
+        endpoint would otherwise tax every later recall.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                pending = list(self._pending_ops)
+            if not pending:
+                return
+            client = self._client
+            if client is None or self._shutdown:
+                with self._lock:
+                    self._pending_ops.difference_update(pending)
+                return
+            done: set[str] = set()
+            for op_id in pending:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    status = str(client.operation_status(self._bank_id, op_id).get("status") or "").lower()
+                except HindsightError as exc:
+                    logger.debug("hindsight: retain op status check failed for %s: %s", op_id, exc)
+                    continue
+                if status in ("completed", "failed", "cancelled"):
+                    done.add(op_id)
+            with self._lock:
+                self._pending_ops.difference_update(done)
+            if time.monotonic() >= deadline:
+                with self._lock:
+                    stale = list(self._pending_ops)
+                    self._pending_ops.difference_update(stale)
+                if stale:
+                    logger.debug(
+                        "hindsight: %d retain operation(s) still pending after %.1fs; dropping",
+                        len(stale),
+                        timeout,
+                    )
+                return
+            if not done:
+                time.sleep(0.05)
+
     def _retain_turn(
         self, user_content: str, assistant_content: str, *, final: bool = False
     ) -> None:
@@ -591,12 +700,13 @@ class HindsightMemoryProvider(MemoryProvider):
             "kind": "session_end" if final else "turn",
         }
         try:
-            client.retain(
+            result = client.retain(
                 self._bank_id,
                 content,
                 context="conversation turn" if not final else "session summary",
                 metadata=metadata,
             )
+            self._track_retain(result)
         except HindsightError as exc:
             logger.debug("hindsight: turn retention failed: %s", exc)
 
@@ -681,7 +791,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 if value:
                     attrs[key] = str(value)
         try:
-            self._client.retain(self._bank_id, text, context=store, metadata=attrs)
+            result = self._client.retain(self._bank_id, text, context=store, metadata=attrs)
+            self._track_retain(result)
         except HindsightError as exc:
             logger.debug("hindsight: memory mirror failed: %s", exc)
 
@@ -794,11 +905,32 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- introspection ----------------------------------------------------------
 
     def identity_signature(self) -> dict[str, Any]:
-        """Identity-mapping values that must bust a cached gateway agent when changed."""
+        """Identity-mapping values that must bust a cached gateway agent when changed.
+
+        The gateway calls this on an UNINITIALIZED instance on every inbound message
+        (see ``MemoryProvider.identity_signature``), so it must read the CONFIGURED
+        namespace from disk, not the instance state — on an uninitialized instance
+        ``self._namespace`` is still the default, and reading it here would report
+        ``hermes`` forever and never bust the cache when the namespace changed.
+
+        The base URL is included too: it selects the substrate, so a change of
+        substrate must bust the cache just as a change of bank must.
+        """
         cfg = _load_config()
+        namespace = str(cfg.get("namespace") or "").strip()
+        if namespace:
+            try:
+                namespace = normalize_namespace(namespace)
+            except NamespaceError:
+                namespace = self._namespace or DEFAULT_NAMESPACE
+        else:
+            namespace = self._namespace or DEFAULT_NAMESPACE
         return {
-            "hermes_memory_hindsight.namespace": self._namespace or str(cfg.get("namespace") or ""),
-            "hermes_memory_hindsight.bank": self._bank_id,
+            "hermes_memory_hindsight.namespace": namespace,
+            "hermes_memory_hindsight.bank": self._bank_id or namespace,
+            "hermes_memory_hindsight.base_url": str(
+                cfg.get("base_url") or get_secret("HINDSIGHT_API_URL", "") or DEFAULT_BASE_URL
+            ).rstrip("/"),
         }
 
     def get_context(self) -> dict[str, Any]:

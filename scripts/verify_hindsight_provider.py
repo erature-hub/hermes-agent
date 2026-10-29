@@ -111,6 +111,29 @@ def main() -> int:
         bool(provider._api_key) and "hs_live" not in repr(provider.get_context()),
     )
 
+    _section("2b. per-owner namespace isolation (real substrate)")
+    # An owner namespace must get its OWN bank, not the shared one: otherwise one
+    # owner's memories are recalled under another owner's namespace.
+    owner_bank = f"erature-liveverify{int(time.time()) % 100000}"
+    owner_alias = f"erature/liveverify{int(time.time()) % 100000}"
+    try:
+        client._request("PUT", f"/v1/default/banks/{owner_bank}", body={"name": "verify owner"})
+        client._request("POST", f"/v1/default/banks/{owner_bank}/aliases", body={"alias": owner_alias})
+        resolver = provider._resolver
+        resolved = resolver.ensure_namespace(owner_alias)
+        check(
+            "an owner namespace resolves to a bank of its own",
+            resolved == owner_bank and resolved != provider._bank_id,
+            resolved,
+        )
+        check(
+            "the owner namespace is addressable as an alias",
+            any(owner_alias in (b.get("matched_aliases") or []) for b in client.list_banks(query=owner_alias)),
+            owner_alias,
+        )
+    finally:
+        client._request("DELETE", f"/v1/default/banks/{owner_bank}")
+
     _section("3. commencement recall (background, real shared bank)")
     deadline = time.time() + 40
     while time.time() < deadline and not provider._prefetch_text:
@@ -180,6 +203,11 @@ def main() -> int:
         )
 
         provider.on_memory_write("add", "memory", f"The verification marker is {marker}.")
+        # The mirror is an ASYNC retain: the substrate accepts it and extracts in
+        # the background, so the fact is not recall-visible until the operation
+        # settles. Wait for it — that is exactly what the provider's own
+        # commencement recall does before it recalls.
+        provider._await_pending_ops(10.0)
         mirrored = client.recall(THROWAWAY_BANK, marker, budget="low")
         check(
             "a built-in memory write reached the substrate",

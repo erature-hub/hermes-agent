@@ -16,6 +16,7 @@ it only decides which canonical bank id a logical namespace means.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import Any
@@ -77,6 +78,31 @@ def owner_of(namespace: str) -> str:
         return ""
     prefix, _, owner = value.partition("/")
     return owner.strip() if prefix == OWNER_NAMESPACE_PREFIX else ""
+
+
+def owner_bank_id(namespace: str) -> str:
+    """The dedicated bank id an owner namespace is provisioned under.
+
+    A bank id is a REST path segment, so it cannot contain a slash — the owner
+    namespace's slash form is an ALIAS on this id, and the alias is what the
+    namespace resolves to.
+
+    The id is derived from the owner segment so it is stable and human-readable
+    (``erature/paul`` -> ``erature-paul``). When sanitizing the owner segment
+    would make it lossy (``pa ul`` -> ``pa-ul``, which would collide with the
+    distinct owner ``pa-ul``), a short digest of the ORIGINAL segment is appended
+    so two owners can never be provisioned onto one bank.
+    """
+    owner = owner_of(namespace)
+    if not owner:
+        return ""
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", owner).strip("-_")
+    if not sanitized:
+        sanitized = "owner"
+    if sanitized != owner:
+        digest = hashlib.sha256(owner.encode("utf-8")).hexdigest()[:8]
+        sanitized = f"{sanitized}-{digest}"
+    return f"{OWNER_NAMESPACE_PREFIX}-{sanitized}"
 
 
 class BankResolver:
@@ -207,35 +233,61 @@ class BankResolver:
         return wanted
 
     def ensure_namespace(self, namespace: str) -> str:
-        """Resolve ``namespace`` and, when it is an owner namespace, make it addressable.
+        """Resolve ``namespace`` and make it addressable.
 
-        The slash form cannot be a REST path segment, so it is provisioned as an alias
-        on the shared bank — which is exactly what makes ``erature/<owner>`` usable.
+        The shared ``hermes`` namespace addresses the shared bank as-is.
+
+        An owner namespace gets its OWN bank (``erature/paul`` -> ``erature-paul``),
+        because the slash form cannot be a REST path segment and therefore cannot be a
+        bank id. The slash form is registered as an ALIAS on that dedicated bank, so
+        the namespace stays addressable and the owner's memories stay SEPARATE from
+        the shared substrate and from every other owner's.
+
+        Provisioning is idempotent: an existing bank (or an existing alias pointing
+        at one) is reused, never recreated.
         """
         wanted = normalize_namespace(namespace)
-        canonical = self.canonical_bank(wanted)
         owner = owner_of(wanted)
         if not owner:
-            return canonical
-        # Ensure the slash namespace is registered as an alias of the canonical bank.
+            return self.canonical_bank(wanted)
+
+        dedicated = owner_bank_id(wanted)
+        # An alias for this namespace may already exist on some bank (it was
+        # provisioned earlier, or by hand) — that bank is the owner's, and it wins.
+        existing = self._canonical_by_namespace.get(wanted)
+        if not existing:
+            self._refresh_index()
+            existing = self._canonical_by_namespace.get(wanted)
+        if not existing:
+            discovered = self._discover_via_query(wanted)
+            if discovered:
+                existing = discovered
+        if existing:
+            self._canonical_by_namespace[wanted] = existing
+            return existing
+
+        # No bank carries this namespace yet: provision the dedicated one, then
+        # register the slash form as its alias.
         try:
-            aliases = self._client.bank_aliases(canonical)
+            self._client.ensure_bank(dedicated, name=f"Erature / {owner}")
         except HindsightError as exc:
-            logger.debug("hindsight alias read for %s failed: %s", canonical, exc)
-            return canonical
-        existing = {
-            str(e.get("alias"))
-            for e in (aliases.get("aliases") or [])
-            if isinstance(e, dict) and e.get("alias")
-        }
-        if wanted not in existing:
-            try:
-                self._client.add_bank_alias(canonical, wanted)
-                logger.info("hindsight: registered namespace alias %r on bank %r", wanted, canonical)
-            except HindsightError as exc:
-                logger.debug("hindsight alias write for %r failed: %s", wanted, exc)
-        self._canonical_by_namespace[wanted] = canonical
-        return canonical
+            logger.warning("hindsight: could not provision bank %r for %r: %s", dedicated, wanted, exc)
+            fallback = self.canonical_bank(wanted)
+            self._canonical_by_namespace[wanted] = fallback
+            return fallback
+        try:
+            self._client.add_bank_alias(dedicated, wanted)
+            logger.info(
+                "hindsight: provisioned namespace %r as bank %r", wanted, dedicated
+            )
+        except HindsightError as exc:
+            # The alias could not be registered (e.g. it is already taken by another
+            # bank). The dedicated bank still addresses this namespace, so keep it —
+            # losing the write would be worse than an undiscoverable alias.
+            logger.debug("hindsight: alias write for %r failed: %s", wanted, exc)
+        self._canonical_by_namespace[wanted] = dedicated
+        self._canonical_by_bank[dedicated] = dedicated
+        return dedicated
 
     def namespaces(self) -> list[str]:
         """Every namespace currently known to the substrate (bank ids + aliases)."""

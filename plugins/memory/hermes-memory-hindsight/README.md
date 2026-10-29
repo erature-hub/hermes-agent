@@ -31,6 +31,17 @@ rule the agent adopted), the cue list is conservative, and a decision is promote
 
 Only the **primary** agent context writes. Subagent, cron and flush contexts do not.
 
+> **Retains are asynchronous.** The substrate accepts a retain immediately and
+> extracts the fact in the background. That is deliberate: measured against the live
+> shared bank (13k facts), a *synchronous* retain took 2–4s for a normal turn and
+> 9–10s when extraction flaked — and a flaky extraction answers **500**, losing the
+> fact outright. The async path returns in ~24ms, the substrate owns the retry
+> (`retry_count` / `next_retry_at` on the operation record), and the write is not lost.
+>
+> The provider tracks each operation id and waits (bounded, **in the background**) for
+> it to settle before the next recall — so a turn is recall-visible on the next turn
+> without the reply ever waiting on the substrate.
+
 ### 3. Built-in memory mirror
 
 Hermes' built-in MEMORY/USER stores are the operator's most durable artifact — an
@@ -38,9 +49,17 @@ explicit "remember this" note. They are mirrored into the substrate, so a note w
 on one surface is recallable on every other. Without this, the note lives only on local
 disk, which is exactly the amnesia this provider exists to remove.
 
-A `remove` cannot be applied precisely (the substrate's delete is by memory id, and a
-mirrored copy has no stable id), so the retraction is *recorded* instead — the
-extractor sees "X was retracted" and can drop the superseded claim.
+A `remove` cannot be applied precisely: a mirrored copy has no stable memory id, so
+there is nothing to invalidate. The retraction is *recorded* instead — the extractor
+sees "X was retracted" and can drop the superseded claim.
+
+> **The substrate has no per-memory DELETE.** `DELETE
+> /v1/default/banks/{bank}/memories/{memory}` answers **405 Method Not Allowed**
+> (verified against the live substrate; the OpenAPI lists only GET and PATCH there).
+> The real per-memory removal is the **curation** route — `PATCH
+> /memories/{memory_id}` with `state="invalidated"`, which excludes the memory from
+> recall, consolidation and graph maintenance while keeping it for audit. The
+> client's `delete_memory()` uses that route.
 
 ### 4. Bank namespacing
 
@@ -50,6 +69,14 @@ extractor sees "X was retracted" and can drop the superseded claim.
 | `erature/<owner>` | a per-owner namespace, e.g. `erature/paul` |
 
 A bare owner name (`paul`) is accepted as the ergonomic spelling of `erature/paul`.
+
+> **Each owner gets its OWN bank.** An owner namespace is provisioned as a dedicated
+> bank (`erature/paul` → the bank `erature-paul`), not the shared one — otherwise
+> every owner reads and writes the same corpus and the namespace stops being a
+> boundary. The dedicated bank is created on first use and reused thereafter.
+>
+> A lossy owner name (`pa ul` → `pa-ul`) gets a short digest appended, so two
+> different owners can never be provisioned onto one bank.
 
 > **Substrate routing constraint (verified, not assumed).** Hindsight addresses a bank
 > by a REST *path segment*, and its router does not decode `%2F` into a bank id — so a
@@ -75,6 +102,11 @@ The credential is `HINDSIGHT_API_KEY`, read through `agent.secret_scope.get_secr
 the active profile's scope applies (and a multiplexed profile never inherits another
 profile's key). It is never logged, never written to the repo, and never included in
 an error message.
+
+As a fallback, an `api_key` in the provider's own `config.json` is honored — that is
+the same location the Dashboard's flat-json storage and the community `hindsight`
+plugin use, so a key placed there activates the provider. The **env store wins** when
+both are present, so a rotated key is never shadowed by a stale file value.
 
 Activate it with `memory.provider: hermes-memory-hindsight` in the profile's
 `config.yaml`.
