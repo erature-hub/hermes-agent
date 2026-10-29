@@ -1107,7 +1107,8 @@ _PLUGIN_ACTIONS = {
         ref=getattr(args, "ref", None),
         allow_removed=getattr(args, "allow_removed", False),
         no_deps=getattr(args, "no_deps", False),
-        yes_deps=getattr(args, "yes_deps", False)),
+        yes_deps=getattr(args, "yes_deps", False),
+        publisher_key=getattr(args, "publisher_key", None)),
     "search": lambda args: _catalog().cmd_search(
         getattr(args, "term", "") or "", json_output=getattr(args, "json", False)),
     "browse": lambda args: _catalog().cmd_search(""),

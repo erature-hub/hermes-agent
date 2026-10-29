@@ -19,8 +19,13 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
         "install", help="Install a plugin from the curated catalog, a Git URL, or owner/repo")
     plugins_install.add_argument(
         "identifier",
-        help="Bare plugin catalog entry name (see `hermes plugins search`), Git URL, or owner/repo "
+        help="Bare plugin catalog entry name (see `hermes plugins search`), a scoped distribution "
+            "(e.g. @erature/vertical-stack), Git URL, or owner/repo "
             "shorthand (e.g. anpicasso/hermes-plugin-chrome-profiles)")
+    plugins_install.add_argument(
+        "--publisher-key", metavar="KEY",
+        help="Publisher public key (base64 or hex) used to verify a scoped distribution's signature; "
+             "defaults to the key published in the distribution registry")
     plugins_install.add_argument(
         "--force", "-f", action="store_true",
         help="Reinstall over an existing plugin (from the same source, your untracked files are kept)")

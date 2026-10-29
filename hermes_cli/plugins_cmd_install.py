@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hermes_cli.cli_output import line_input
+from hermes_cli.plugin_distributions import is_scoped_name
 from hermes_cli.plugin_install_phase import InstallPhase
 
 logger = logging.getLogger(__name__)
@@ -396,6 +397,7 @@ def _install_plugin_core(
     catalog: Optional[dict] = None,
     allow_removed: bool = False,
     before_swap=None,
+    tree_verifier=None,
     app_title: Optional[str] = None,
     inspected_sha: Optional[str] = None,
 ) -> tuple[Path, dict, str]:
@@ -414,7 +416,10 @@ def _install_plugin_core(
     *before_swap(manifest, tree)* runs on the manifest-checked clone BEFORE the security scan, so
     the single scan and portable-package check admit the merged tree (file-count/size limits
     included). It may return the relative paths it merged in, which a scan block then attributes,
-    and may raise :class:`PluginOperationError` to abort (re-pin consent). *accept_caution* decides a
+    and may raise :class:`PluginOperationError` to abort (re-pin consent). *tree_verifier(tree)*
+    runs on the same pristine clone, before the scan and before publication, and raises to refuse
+    the install when the fetched bytes do not match a pinned content digest (the scoped-distribution
+    path uses it for the publisher's signed sha256). *accept_caution* decides a
     caution scan verdict on its own when *force* only means "replace the existing tree" (an update's
     re-clone); None lets *force* decide both, as ``install --force`` does. *inspected_sha*: see
     :func:`_clone_at_reviewed_commit`."""
@@ -476,6 +481,13 @@ def _install_plugin_core(
         # A callback may merge user-owned state into the candidate tree; run it first so one scan
         # admits the final bytes.
         merged = before_swap(manifest, tmp_target) if before_swap is not None else None
+        # Verify the candidate tree's CONTENT against a signed digest, before the scan and before
+        # anything is published. A distribution pins each component's bytes with a sha256 over its
+        # file tree; this refuses a tree whose bytes do not match the publisher's signed manifest.
+        # It runs on the PRISTINE clone (before any user-file merge), so the digest covers exactly
+        # what was fetched.
+        if tree_verifier is not None:
+            tree_verifier(tmp_target)
         # Scan BEFORE anything is moved into place; raises PluginScanBlocked when blocked.
         _pc()._scan_merged_tree(tmp_target, identifier, merged, force=force if accept_caution is None else accept_caution,
                                 scan_decision_cb=scan_decision_cb, reviewed_pin=at_reviewed_pin)
@@ -605,6 +617,52 @@ def _announce_source(identifier: str, console, *, brief: bool) -> tuple[Optional
     return entry, entry.install_identifier
 
 
+def _install_scoped_distribution(
+    identifier: str,
+    console,
+    *,
+    force: bool = False,
+    publisher_key: Optional[str] = None,
+    allow_removed: bool = False,
+    enable: Optional[bool] = None,
+    no_deps: bool = False,
+    yes_deps: bool = False,
+) -> None:
+    """Install a scoped distribution (``@scope/name``) and report the outcome.
+
+    Fail-closed: an unpublished distribution, an unsigned or wrongly-signed manifest, or a
+    content-digest mismatch aborts BEFORE any component is installed. The per-component
+    fan-out reports each outcome and the command exits non-zero if any component failed.
+    """
+    from hermes_cli.plugin_distributions import DistributionError
+    from hermes_cli.plugin_distributions_install import install_distribution
+
+    try:
+        result = install_distribution(
+            identifier, console, force=force, publisher_key=publisher_key,
+            allow_removed=allow_removed, enable=enable, no_deps=no_deps, yes_deps=yes_deps)
+    except DistributionError as exc:
+        _pc()._fail(console, f"[red]Error:[/red] {exc}")
+        return
+
+    if result.ok:
+        console.print(
+            f"[green]✓[/green] Distribution [bold]{result.name}[/bold] installed "
+            f"({len(result.installed)} component(s)).")
+        return
+    for failure in result.failed:
+        console.print(f"[red]✗[/red] {failure.component.display}: {failure.error}")
+    # Exit non-zero: a partial install is a failed install. Returning 0 here would let a
+    # CI job or an operator's script read "exit 0" as "the stack is installed" when the
+    # stack is missing a component. The distribution's own contract is that a failure in
+    # any component fails the command.
+    _pc()._fail(
+        console,
+        f"[red]✗[/red] Distribution [bold]{result.name}[/bold] completed with "
+        f"{len(result.failed)} failed component(s). "
+        "Fix the reported errors and re-run to install the remaining components.")
+
+
 def cmd_install(
     identifier: str,
     force: bool = False,
@@ -614,6 +672,7 @@ def cmd_install(
     no_deps: bool = False,
     yes_deps: bool = False,
     brief: bool = False,
+    publisher_key: Optional[str] = None,
 ) -> None:
     """Install a plugin from the curated catalog (bare name), a Git URL, or owner/repo shorthand.
 
@@ -629,9 +688,24 @@ def cmd_install(
     *brief* is for a caller that already told the user what is being installed and why (first-time
     setup): the catalog line, questions, warnings, errors and the outcome print, the catalog
     description, clone line and default "Installed" panel do not.
+    *publisher_key* overrides the distribution registry's publisher key when the identifier is a
+    scoped distribution (``@scope/name``); it lets an operator verify against a key obtained out
+    of band rather than the one the registry ships.
     """
     from hermes_cli import plugins_cmd_catalog as catalog
     console = _pc()._console()
+
+    # A scoped distribution (@scope/name) is a bundle, not a single plugin: it takes the
+    # distribution path (signature + digest verification, then a dependency-ordered fan-out)
+    # instead of the single-plugin clone path. It is checked FIRST because the ordinary path
+    # would misparse '@erature/vertical-stack' as owner/repo shorthand.
+    if is_scoped_name(identifier):
+        _install_scoped_distribution(identifier, console, force=force,
+                                     publisher_key=publisher_key,
+                                     allow_removed=allow_removed,
+                                     enable=enable, no_deps=no_deps, yes_deps=yes_deps)
+        return
+
     entry, identifier = _announce_source(identifier, console, brief=brief)
     if allow_removed:
         console.print(

@@ -1,0 +1,71 @@
+{
+  "components": [
+    {
+      "capabilities": [
+        "memory_provider",
+        "tool:hindsight_recall",
+        "tool:hindsight_retain"
+      ],
+      "digest": "2efdbc17950e9596106c0ecc7ed9b787e43c69b35ed581973bad9331c2e0f39d",
+      "name": "hermes-memory-hindsight",
+      "ref": "a8b7a09c9323f2a99a03351af68717c7c04bfab6",
+      "repo": "erature-hub/hermes-agent",
+      "requires": [],
+      "role": "memory",
+      "subdir": "plugins/memory/hermes-memory-hindsight"
+    },
+    {
+      "capabilities": [
+        "hook:feed_subscribe"
+      ],
+      "digest": "8091c7b96a839e261daea220b05bd82e7703eaa2c13d058c4cdc42a57fb1ac28",
+      "name": "hermes-rss",
+      "ref": "11f8ea42e353a8fa228ed1e2b40e5bc10a9bdee3",
+      "repo": "Adolanium/hermes-rss",
+      "requires": [
+        "hermes-memory-hindsight"
+      ],
+      "role": "reader",
+      "subdir": "catalog"
+    },
+    {
+      "capabilities": [
+        "command:delegation"
+      ],
+      "digest": "7b15af1294a8da29f7370568c9bc29e4698a65a98cf86c9502989f7a84c88894",
+      "name": "advanced-delegation",
+      "ref": "e404b6816b20237a82f6fbe2749b5a576cf75dba",
+      "repo": "NousResearch/hermes-official-plugins",
+      "requires": [],
+      "role": "dispatcher",
+      "subdir": "advanced-delegation"
+    },
+    {
+      "capabilities": [
+        "tool:jev_ask",
+        "hook:pre_tool_call"
+      ],
+      "digest": "99556b7a1de038cac13d7c14edad039301640065ac99987dd7dba0a0d0807bd8",
+      "name": "jev-judge",
+      "ref": "5dddbeaac5be08281e6c3b372eeaba3639971f0a",
+      "repo": "DoGMaTiiC/hermes-jev",
+      "requires": [],
+      "role": "grader",
+      "subdir": "plugins/jev-judge"
+    }
+  ],
+  "description": "The Erature sovereign vertical stack: episodic memory (Hindsight), a memory-aware reading surface, specialized task dispatch, and output grading.",
+  "distribution_version": 1,
+  "name": "@erature/vertical-stack",
+  "publisher": "Erature",
+  "required_roles": [
+    "memory",
+    "reader",
+    "dispatcher",
+    "grader"
+  ],
+  "requires_hermes": ">=0.21.4",
+  "signature": "bzWP2Yefqhs9UdtRqP2S1cgKLt7mfPWmjErm5Qrofa6xIUPoXnpamtv0JrjSpTyPbNRJubECcLDYAPWUH9qLAQ==",
+  "signature_algorithm": "ed25519",
+  "version": "1.0.0"
+}
