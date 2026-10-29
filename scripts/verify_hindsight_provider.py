@@ -9,14 +9,18 @@ Safety model, because the substrate has no per-memory delete:
 
 * **Read-only checks** run against the REAL shared bank (``erature-hermes``) — that is
   where the standing directives and the real recall corpus live, so it is the only
-  place the check means anything.
+  place the check means anything. The provider is REBOUND onto that bank for the
+  read-only section and put back on the profile's own bank afterwards: a profile
+  configured for an isolated ``erature/<owner>`` namespace has its own (initially
+  empty) bank, and reading that instead would report a healthy substrate as broken.
 * **Write checks** run against a dedicated THROWAWAY bank, which is deleted
   afterwards. The substrate exposes no per-memory ``DELETE`` (only a destructive
   whole-bank clear), so writing into the shared bank would leave residue that cannot
   be removed one memory at a time. The throwaway bank is deleted instead, which
   cascades its memories and aliases away.
 
-Net effect on the substrate: none.
+Net effect on the substrate: none. The shared bank's fact count is compared before
+and after the run, so a leaked write is caught rather than assumed away.
 
 Usage:
     ./.venv/Scripts/python.exe scripts/verify_hindsight_provider.py
@@ -73,6 +77,32 @@ def _section(title: str) -> None:
     print(f"\n=== {title}")
 
 
+def _configured_namespace() -> str | None:
+    """The namespace the profile's own config asks for, if it asks for one.
+
+    Read straight from the provider's config file so the check is independent of
+    the provider's own parsing. ``None`` means the profile is on the default.
+    """
+    path = (
+        pathlib.Path.home()
+        / "AppData"
+        / "Local"
+        / "hermes"
+        / "profiles"
+        / "sentinel"
+        / "hermes-memory-hindsight"
+        / "config.json"
+    )
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    value = data.get("namespace") if isinstance(data, dict) else None
+    return str(value).strip() or None if value else None
+
+
 def main() -> int:
     key = _api_key()
     os.environ["HINDSIGHT_API_KEY"] = key
@@ -100,16 +130,34 @@ def main() -> int:
         ),
     )
     check("provider bound to a client", provider._client is not None)
-    check("namespace resolved", provider._namespace == "hermes", provider._namespace)
+    # The CONFIGURED namespace, not a hardcoded one: a profile may legitimately run
+    # the shared ``hermes`` namespace or an isolated ``erature/<owner>`` one, and
+    # the provider must honor whichever the profile asked for. The check is that
+    # the config -> namespace -> canonical-bank chain holds, not that a particular
+    # namespace happens to be configured.
+    configured = _configured_namespace()
+    check(
+        "the configured namespace is what the provider resolved",
+        configured is None or provider._namespace == configured,
+        f"configured={configured} resolved={provider._namespace}",
+    )
     check(
         "bank resolved to a canonical id (no slash, no %2F)",
         "/" not in provider._bank_id and "%2F" not in provider._bank_id.upper(),
         provider._bank_id,
     )
     check(
+        "the resolved bank exists on the substrate",
+        bool(client.get_bank(provider._bank_id).get("bank_id")),
+        provider._bank_id,
+    )
+    check(
         "credential present but not exposed",
         bool(provider._api_key) and "hs_live" not in repr(provider.get_context()),
     )
+    # The bank this profile is bound to, captured BEFORE the read-only checks
+    # rebind the provider onto the shared bank.
+    profile_bank = provider._bank_id
 
     _section("2b. per-owner namespace isolation (real substrate)")
     # An owner namespace must get its OWN bank, not the shared one: otherwise one
@@ -135,6 +183,29 @@ def main() -> int:
         client._request("DELETE", f"/v1/default/banks/{owner_bank}")
 
     _section("3. commencement recall (background, real shared bank)")
+    # The read-only checks below MUST run against the shared bank: that is where the
+    # standing directives and the real recall corpus live, so it is the only place the
+    # check means anything. A profile configured for an isolated owner namespace has
+    # its own (initially empty) bank, and reading THAT would report a working
+    # substrate as broken. So the provider is rebound onto the shared bank for the
+    # read-only section and restored afterwards.
+    shared_bank = provider._resolver.canonical_bank("hermes")
+    shared_facts_before = int(client.get_bank(shared_bank).get("fact_count") or 0)
+    check(
+        "the shared bank resolves to a canonical id",
+        bool(shared_bank) and "/" not in shared_bank,
+        shared_bank,
+    )
+    check(
+        "the shared bank holds the standing corpus",
+        shared_facts_before > 0,
+        f"{shared_facts_before} facts",
+    )
+    provider._namespace = "hermes"
+    provider._owner = ""
+    provider._bank_id = shared_bank
+    provider._request_recall()
+
     deadline = time.time() + 40
     while time.time() < deadline and not provider._prefetch_text:
         time.sleep(0.2)
@@ -180,7 +251,6 @@ def main() -> int:
     )
 
     _section("5. write checks (dedicated throwaway bank, deleted afterwards)")
-    shared_bank = provider._bank_id
     marker = f"live-verify-probe-{int(time.time())}"
     try:
         client._request("PUT", f"/v1/default/banks/{THROWAWAY_BANK}", body={"name": "verify probe"})
@@ -225,7 +295,22 @@ def main() -> int:
         not still_there,
         "gone" if not still_there else "STILL PRESENT",
     )
-    check("shared bank untouched", provider._bank_id == shared_bank, shared_bank)
+    # The shared bank must be byte-for-byte unchanged: the same fact count it had
+    # before the run. A write that leaked into it would show up here.
+    shared_facts_after = int(client.get_bank(shared_bank).get("fact_count") or 0)
+    check(
+        "shared bank untouched (no facts written into it)",
+        shared_facts_after == shared_facts_before,
+        f"{shared_facts_before} -> {shared_facts_after} facts",
+    )
+    # The provider is put back on the bank the PROFILE is bound to, not on the
+    # shared bank the read-only checks used.
+    provider._bank_id = profile_bank
+    check(
+        "the profile's own bank was left intact",
+        bool(client.get_bank(profile_bank).get("bank_id")),
+        profile_bank,
+    )
     provider.shutdown()
 
     _section("VERDICT")

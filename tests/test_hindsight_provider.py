@@ -301,7 +301,10 @@ def _default_routes(transport: _FakeTransport | None = None) -> dict[str, Any]:
 
     return {
         "GET /v1/default/banks": list_banks,
-        "GET /v1/default/banks/{bank}": lambda m, b, p, q: {"bank_id": _bank_of(p)},
+        # The substrate registers only DELETE/PATCH/PUT on /banks/{bank_id}: a
+        # single-bank GET is a 405 route miss. The fake mirrors that so a client
+        # that calls it cannot pass the suite and fail live.
+        "GET /v1/default/banks/{bank}": _method_not_allowed,
         "PUT /v1/default/banks/{bank}": put_bank,
         "GET /v1/default/banks/{bank}/aliases": list_aliases,
         "POST /v1/default/banks/{bank}/aliases": add_alias,
@@ -493,6 +496,39 @@ class TestBankResolver:
 
 
 class TestClientWireContract:
+    def test_get_bank_uses_the_list_route_not_the_dead_single_bank_get(self):
+        """``GET /banks/{bank_id}`` is a 405 route on the live substrate.
+
+        The path registers only DELETE/PATCH/PUT, so a single-bank GET answers
+        405 Method Not Allowed. The client must read a bank through the LIST
+        route, and the fake transport raises the real 405 so a regression here
+        fails the suite instead of passing it and failing live.
+        """
+        transport = _transport()
+        client = _make_client(transport)
+        bank = client.get_bank("erature-hermes")
+        assert bank.get("bank_id") == "erature-hermes"
+        assert not [
+            c
+            for c in transport.calls
+            if c["method"] == "GET" and c["path"].endswith("/banks/erature-hermes")
+        ], "the client called the dead single-bank GET route"
+
+    def test_get_bank_matches_the_bank_id_exactly(self):
+        """``?q=`` is a substring filter: a loose match could return another bank."""
+        transport = _transport()
+        transport.banks["erature-paul"] = {
+            "bank_id": "erature-paul",
+            "name": "Erature / paul",
+            "fact_count": 0,
+        }
+        assert _make_client(transport).get_bank("erature-paul").get("bank_id") == "erature-paul"
+        assert _make_client(transport).get_bank("erature-pau") == {}
+
+    def test_get_bank_of_an_unknown_bank_is_empty_not_an_error(self):
+        transport = _transport()
+        assert _make_client(transport).get_bank("no-such-bank") == {}
+
     def test_bearer_auth_is_sent_on_every_v1_call(self):
         transport = _transport()
         client = _make_client(transport, api_key="secret-token")
@@ -639,6 +675,17 @@ def _bank_of(path: str) -> str:
     """The bank id segment of a substrate path."""
     parts = path.split("/")
     return parts[parts.index("banks") + 1] if "banks" in parts else ""
+
+
+def _method_not_allowed(m, b, p, q):
+    """The substrate's 405 for a method a path does not register.
+
+    The live router answers 405 (not 404) when the path exists but the method
+    does not — e.g. ``GET /v1/default/banks/{bank_id}``.
+    """
+    raise HindsightError(
+        "GET /v1/default/banks/{bank} failed (405): Method Not Allowed", status=405
+    )
 
 
 def _provider(monkeypatch, transport, **cfg) -> HindsightMemoryProvider:

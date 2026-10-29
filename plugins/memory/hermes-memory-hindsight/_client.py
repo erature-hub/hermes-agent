@@ -134,8 +134,27 @@ class HindsightClient:
         return list(banks) if isinstance(banks, list) else []
 
     def get_bank(self, bank_id: str) -> dict[str, Any]:
-        payload = self._request("GET", f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}")
-        return payload if isinstance(payload, dict) else {}
+        """One bank's record, looked up through the bank LIST.
+
+        The substrate has NO ``GET /v1/default/banks/{bank_id}`` route: that path
+        answers 405 Method Not Allowed (only DELETE/PATCH/PUT are registered on
+        it), so a single-bank GET is a dead route against the live substrate.
+        The list route IS the way to read one bank's record, and it carries the
+        same fields (``bank_id``, ``fact_count``, ``display_alias``).
+
+        The lookup is by EXACT ``bank_id`` match: ``?q=`` is a substring filter
+        over bank id, name and aliases, so a loose match could return a
+        different bank entirely.
+        """
+        wanted = str(bank_id or "").strip()
+        if not wanted:
+            return {}
+        for bank in self.list_banks(query=wanted, limit=1000):
+            if not isinstance(bank, dict):
+                continue
+            if str(bank.get("bank_id") or "").strip() == wanted:
+                return bank
+        return {}
 
     def bank_aliases(self, bank_id: str) -> dict[str, Any]:
         """``{"bank_id": ..., "aliases": [{"alias": ..., "primary": bool}, ...]}``."""
