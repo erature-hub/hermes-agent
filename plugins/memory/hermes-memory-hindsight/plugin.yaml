@@ -1,0 +1,5 @@
+name: hermes-memory-hindsight
+version: 1.0.0
+description: "Sovereign memory provider — Hermes sessions bridged to the local Hindsight episodic-memory substrate, with proactive commencement recall, automatic decision/directive retention, and hermes / erature/<owner> bank namespacing."
+requires_env:
+  - HINDSIGHT_API_KEY
