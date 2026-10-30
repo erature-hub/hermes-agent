@@ -61,6 +61,12 @@ sees "X was retracted" and can drop the superseded claim.
 > recall, consolidation and graph maintenance while keeping it for audit. The
 > client's `delete_memory()` uses that route.
 
+> **There is no single-bank GET either.** `GET /v1/default/banks/{bank_id}` answers
+> **405 Method Not Allowed** — that path registers only DELETE/PATCH/PUT. A bank is
+> therefore read through the LIST route (`GET /v1/default/banks?q=…`), matched on an
+> EXACT `bank_id`, because `q` is a substring filter over bank id, name and aliases.
+> The client's `get_bank()` does that.
+
 ### 4. Bank namespacing
 
 | Namespace | Meaning |

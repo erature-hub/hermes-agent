@@ -788,6 +788,20 @@ class TestProviderInitialization:
         # It fell back to the namespace itself rather than raising.
         assert provider._bank_id == "hermes"
 
+    def test_initialize_honors_profile_scoped_config_file(self, monkeypatch, tmp_path):
+        """When hermes_home points to a profile, its config.json is loaded."""
+        transport = _transport()
+        monkeypatch.setenv("HINDSIGHT_API_KEY", "test-key")
+        _bind_transport(monkeypatch, transport)
+        profile_home = tmp_path / "profile_sentinel"
+        cfg_dir = profile_home / "hermes-memory-hindsight"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config.json").write_text(json.dumps({"namespace": "erature/paul"}))
+
+        provider = HindsightMemoryProvider()
+        provider.initialize("sess-custom", hermes_home=str(profile_home))
+        assert provider._namespace == "erature/paul"
+
 
 def _isolate_home(monkeypatch) -> Path:
     import os

@@ -127,19 +127,21 @@ def _sentences(text: str) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
-def _config_path() -> Path:
+def _config_path(hermes_home: Path | str | None = None) -> Path:
     """Profile-scoped config file: ``$HERMES_HOME/hermes-memory-hindsight/config.json``.
 
     This is the same path the Dashboard's flat-json storage writes
     (``get_hermes_home()/<provider name>/config.json``), so the panel, ``hermes memory
     setup`` and the running provider all read one file.
     """
+    if hermes_home:
+        return Path(hermes_home) / PROVIDER_NAME / "config.json"
     from hermes_constants import get_hermes_home
 
     return get_hermes_home() / PROVIDER_NAME / "config.json"
 
 
-def _load_config() -> dict[str, Any]:
+def _load_config(hermes_home: Path | str | None = None) -> dict[str, Any]:
     """Provider config: the profile-scoped JSON file, then the config.yaml block.
 
     The JSON file is the surface the Dashboard writes; the config.yaml block is the
@@ -148,7 +150,7 @@ def _load_config() -> dict[str, Any]:
     """
     cfg: dict[str, Any] = {}
     try:
-        path = _config_path()
+        path = _config_path(hermes_home)
         if path.exists():
             raw = path.read_text(encoding="utf-8-sig")
             data = json.loads(raw) if raw.strip() else {}
@@ -330,7 +332,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if key.strip():
             return key.strip()
         try:
-            cfg = _load_config()
+            cfg = _load_config(self._hermes_home)
         except Exception:
             return ""
         for field in ("api_key", "apiKey"):
@@ -411,7 +413,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._platform = str(kwargs.get("platform") or "")
         self._agent_context = str(kwargs.get("agent_context") or "primary")
 
-        cfg = _load_config()
+        cfg = _load_config(self._hermes_home)
         self._base_url = str(
             _safe_secret("HINDSIGHT_API_URL", "") or cfg.get("base_url") or DEFAULT_BASE_URL
         ).rstrip("/")
@@ -685,7 +687,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def _prefetch_timeout(self) -> float:
         """The configured join budget for ``prefetch()`` (never negative)."""
         try:
-            value = float(_load_config().get("prefetch_timeout", PREFETCH_TIMEOUT))
+            value = float(_load_config(self._hermes_home).get("prefetch_timeout", PREFETCH_TIMEOUT))
         except (TypeError, ValueError):
             value = PREFETCH_TIMEOUT
         return max(0.0, value)
@@ -873,7 +875,7 @@ class HindsightMemoryProvider(MemoryProvider):
         client = self._client
         if client is None:
             return
-        cfg = _load_config()
+        cfg = _load_config(self._hermes_home)
         if cfg.get("commitment") is False:
             return
         candidates = _extract_directive_candidates(user_content, assistant_content)
@@ -1070,7 +1072,7 @@ class HindsightMemoryProvider(MemoryProvider):
         The base URL is included too: it selects the substrate, so a change of
         substrate must bust the cache just as a change of bank must.
         """
-        cfg = _load_config()
+        cfg = _load_config(self._hermes_home)
         namespace = str(cfg.get("namespace") or "").strip()
         if namespace:
             try:
