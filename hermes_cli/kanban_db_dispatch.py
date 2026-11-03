@@ -2695,9 +2695,17 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """The profile owner executes; this subprocess only waits for its receipt."""
+    """The profile owner executes; this subprocess only waits for its receipt.
+
+    ``-P`` (do not prepend the cwd to ``sys.path``) is load-bearing, not a
+    hardening nicety: the worker runs with ``cwd=<card workspace>``, and the
+    workspace IS a hermes-agent worktree, so without ``-P`` the workspace sits
+    at ``sys.path[0]`` and satisfies ``hermes_cli`` / ``gateway`` / ``agent``
+    before the pinned ``PYTHONPATH`` is consulted -- the worker would run the
+    card's disposable tree, which the dispatcher deletes when the card ends.
+    """
     import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    return [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
@@ -2749,6 +2757,66 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
         require_restart_safe_scope=True,
         outlives_parent=True,
     ).argv
+
+
+def _assert_worker_code_root(env: dict, workspace: str) -> None:
+    """Fail closed unless the worker's OWN env resolves the runtime from a permitted root.
+
+    The worker is ``python -P -m hermes_cli.kanban_worker_client`` with
+    ``cwd=workspace``. The ``-P`` flag is what keeps the workspace off
+    ``sys.path[0]``: for ``-m`` Python would otherwise put the cwd first, and
+    the workspace IS a hermes-agent worktree, so it would satisfy ``hermes_cli``
+    before ``PYTHONPATH`` is consulted.
+
+    Two things are checked, both of them things the worker env actually
+    determines:
+
+    * the ``PYTHONPATH`` the worker gets -- the pin in
+      ``pin_hermes_tree_on_pythonpath`` refuses a card workspace, and this
+      re-checks it after every other decision has been applied to the env;
+    * the shared environments' editable mapping -- a ``pip install -e`` run
+      inside a card workspace writes the workspace into a shared environment's
+      ``__editable__`` finder, and that mapping is what a later import
+      resolves through.
+
+    The check is deliberately in-process and filesystem-only: it must not depend
+    on importing the very modules whose resolution is in question.
+    """
+    from hermes_cli.runtime_code_root import (
+        CanonicalCodeRootError,
+        _is_under,
+        assert_no_workspace_editable_mapping,
+        canonical_code_root,
+        is_card_workspace_path,
+        permitted_code_roots,
+    )
+
+    root = canonical_code_root()
+    permitted = permitted_code_roots()
+
+    # 1. The PYTHONPATH the worker will boot with.
+    offenders: list[str] = []
+    entries = [e for e in env.get("PYTHONPATH", "").split(os.pathsep) if e]
+    for entry in entries:
+        if is_card_workspace_path(entry):
+            offenders.append(f"PYTHONPATH names a card workspace ({entry})")
+        elif not any(_is_under(entry, permitted_root) for permitted_root in permitted):
+            offenders.append(f"PYTHONPATH names a tree outside every permitted code root ({entry})")
+    if not entries:
+        offenders.append("PYTHONPATH is empty: the worker would resolve the runtime from its cwd")
+
+    # 2. The shared environments' editable mapping.
+    site_packages = [e for e in entries if os.path.basename(e).lower() in ("site-packages", "dist-packages")]
+    try:
+        assert_no_workspace_editable_mapping(site_packages)
+    except CanonicalCodeRootError as exc:
+        offenders.append(str(exc))
+
+    if offenders:
+        raise CanonicalCodeRootError(
+            f"the worker's runtime code root is not the deployed checkout ({root}); "
+            f"refusing to start it: " + "; ".join(offenders)
+        )
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
@@ -2867,6 +2935,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # external worker (#112729): applied to the sanitized env, after every other decision stands.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     env = pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parent.parent)
+    # Post-install guard: re-assert the mapping the worker will actually resolve.
+    # The pin above refuses a card workspace, but the worker's env can carry other
+    # PYTHONPATH entries (the sanitizer keeps some), and an editable install in the
+    # workspace writes a sys.meta_path finder that outranks sys.path entirely. So the
+    # worker's OWN resolution is checked, and a worker that would resolve the runtime's
+    # packages out of a disposable tree is not started at all.
+    _assert_worker_code_root(env, workspace)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.

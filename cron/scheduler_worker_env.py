@@ -74,8 +74,30 @@ def pin_hermes_tree_on_pythonpath(worker_env: dict, repo_root: Path) -> dict:
     ``sys.path``. For the cron worker, its boot (``cron/worker_bootstrap.py``) then re-selects
     and leases the committed generation before any third-party import, and exits the worker
     if it cannot.
+
+    ``repo_root`` is the tree of the *calling* process. When that process was itself
+    imported from a kanban card workspace, pinning it would hand the worker a disposable
+    tree as its runtime code root -- and the card's cleanup would then break the worker
+    mid-run. So a card workspace is never pinned: the deployed checkout (resolved from
+    the installation's own record, not from ``__file__``) is pinned instead, and a
+    workspace that cannot be replaced fails closed.
     """
-    root = str(repo_root)
+    from hermes_cli.runtime_code_root import (
+        CanonicalCodeRootError,
+        canonical_code_root,
+        is_card_workspace_path,
+    )
+
+    root_path = Path(repo_root)
+    if is_card_workspace_path(root_path):
+        try:
+            root_path = canonical_code_root()
+        except CanonicalCodeRootError as exc:
+            raise CanonicalCodeRootError(
+                f"refusing to pin a card workspace ({repo_root}) as the runtime's code "
+                f"root: {exc}"
+            ) from exc
+    root = str(root_path)
     if _installed_purelib() == Path(root).resolve():
         return worker_env
     existing = [e for e in worker_env.get("PYTHONPATH", "").split(os.pathsep) if e]

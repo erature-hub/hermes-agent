@@ -42,6 +42,22 @@ import sys
 # Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
 # is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
+# A kanban card workspace is a DISPOSABLE tree: the dispatcher deletes it when the card
+# ends. When this process was launched from one (``-m`` puts the cwd on sys.path[0], and
+# the workspace is a hermes-agent worktree), pinning that tree here would make the whole
+# runtime -- and every process it spawns -- resolve its own packages from a directory
+# that can vanish under it. Pin the deployed checkout instead, resolved from the
+# installation's own record rather than from ``__file__``. A workspace that cannot be
+# replaced fails closed rather than serving from a disposable tree.
+try:
+    from hermes_cli.runtime_code_root import canonical_code_root, is_card_workspace_path
+
+    if is_card_workspace_path(_bootstrap_root):
+        _bootstrap_root = str(canonical_code_root())
+except Exception:
+    # The guard is unavailable this early (a pre-PM tree, a partial import). Keep the
+    # self-derived root: the callers that pin a code root re-check it fail-closed.
+    pass
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
 from hermes_cli import _startup_fast
