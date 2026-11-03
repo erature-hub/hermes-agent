@@ -288,3 +288,91 @@ def command_deletes_runtime(command: str) -> Optional[str]:
                 return hit
 
     return None
+
+
+#: ``-e <path>`` / ``--editable <path>`` / ``--editable=<path>`` in the RAW command text.
+#:
+#: The raw text is matched rather than a token list because ``shlex.split`` (POSIX mode)
+#: eats the backslashes of a Windows path: ``C:\Users\...`` comes back as
+#: ``C:Users...``, which no longer names a card workspace and silently defeats the
+#: check. The path group stops at whitespace, so both separators survive.
+_EDITABLE_TARGET_RES = (
+    re.compile(r"(?:^|\s)(?:-e|--editable)=(?P<path>\"[^\"]+\"|'[^']+'|[^\s]+)", re.IGNORECASE),
+    re.compile(r"(?:^|\s)(?:-e|--editable)\s+(?P<path>\"[^\"]+\"|'[^']+'|[^\s]+)", re.IGNORECASE),
+)
+
+
+def _editable_install_target(segment: str) -> Optional[str]:
+    """The path an editable install in ``segment`` would point at, else ``None``.
+
+    Recognizes ``pip install -e <path>``, ``pip install --editable <path>``,
+    ``pip install --editable=<path>`` and the ``uv pip`` spellings. The
+    ``-e <path>`` form is the one that matters: it writes an ``__editable__``
+    finder into the TARGET environment, and that finder is a ``sys.meta_path``
+    finder, so it wins the resolution of the mapped top-level names over
+    ``sys.path`` entirely.
+    """
+    for pattern in _EDITABLE_TARGET_RES:
+        match = pattern.search(segment)
+        if not match:
+            continue
+        target = match.group("path").strip()
+        if len(target) >= 2 and target[0] == target[-1] and target[0] in "\"'":
+            target = target[1:-1]
+        if target:
+            return target
+    return None
+
+
+def _is_pip_command(segment: str) -> bool:
+    """True when ``segment`` invokes pip (directly, via ``uv pip``, or ``python -m pip``)."""
+    words = segment.split()
+    if not words:
+        return False
+    name = os.path.basename(words[0]).lower()
+    if name in ("pip", "pip3"):
+        return True
+    if name == "uv":
+        # ``uv pip ...`` is the pip spelling; ``uv sync`` / ``uv run`` are not.
+        return len(words) > 1 and words[1].lower() == "pip"
+    if name in ("python", "python3", "py"):
+        return "pip" in [w.lower() for w in words[1:4]]
+    return False
+
+
+def command_repoints_runtime_root(command: str) -> Optional[str]:
+    """Description of the card workspace an editable install would pin, else ``None``.
+
+    A kanban card workspace is a DISPOSABLE hermes-agent worktree. Installing it
+    editable into a shared environment writes that workspace into the
+    environment's ``__editable__`` finder, and the finder -- being a
+    ``sys.meta_path`` finder -- then answers every later import of ``gateway`` /
+    ``hermes_cli`` / ``agent`` / ``tools`` / ``cron`` from the disposable tree.
+    The card's cleanup deletes it, and the running runtime's code goes with it.
+
+    So an editable install of a card workspace is refused. Installing the
+    DEPLOYED checkout editable is fine, and so is installing some unrelated
+    package: only a card workspace is refused.
+    """
+    if not command or not command.strip():
+        return None
+    try:
+        from hermes_cli.runtime_code_root import is_card_workspace_path
+    except Exception:  # pragma: no cover - the guard is in-tree
+        return None
+
+    for segment in _SEGMENT_SPLIT_RE.split(command):
+        if not _is_pip_command(segment):
+            continue
+        target = _editable_install_target(segment)
+        if not target:
+            continue
+        if target in (".", ".."):
+            # A relative target: the cwd decides, and the cwd is the workspace.
+            target = os.getcwd()
+        if is_card_workspace_path(target):
+            return (
+                f"an editable install of the card workspace {target}, which would repoint "
+                "the runtime's own code root at a disposable tree"
+            )
+    return None

@@ -725,6 +725,34 @@ def _prepend_pythonpath(env_overlay: dict[str, str], entries: list[str]) -> None
     env_overlay["PYTHONPATH"] = os.pathsep.join(clean_entries)
 
 
+def _runtime_code_root(project_root: Path) -> Path:
+    """The tree the runtime may resolve its own packages from.
+
+    ``project_root`` is the tree this process imported ``hermes_cli`` from. When that tree
+    is a kanban card workspace, the disposable tree would otherwise become the runtime's
+    code root -- and, because the respawn re-pins it on every restart, the hijack would be
+    self-sustaining. The deployed checkout (resolved from the installation's own record,
+    never from ``__file__``) is used instead; a workspace that cannot be replaced fails
+    closed.
+    """
+    from hermes_cli.runtime_code_root import (
+        CanonicalCodeRootError,
+        canonical_code_root,
+        is_card_workspace_path,
+    )
+
+    if not is_card_workspace_path(project_root):
+        return project_root
+    try:
+        return canonical_code_root()
+    except CanonicalCodeRootError as exc:
+        logger.error(
+            "Refusing to run from a card workspace as the runtime's code root (%s): %s",
+            project_root, exc,
+        )
+        raise
+
+
 def _build_gateway_argv(home: Path | None = None) -> tuple[list[str], str, dict[str, str]]:
     """Build (argv, working_dir, env_overlay) for the gateway subprocess — the same logical command
     as gateway.cmd, assembled as a native argv so no cmd.exe layer sits in between."""
@@ -734,7 +762,7 @@ def _build_gateway_argv(home: Path | None = None) -> tuple[list[str], str, dict[
     python_path, working_dir, hermes_home, profile_arg = _launcher_settings(home)
     python_exe, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
     env_overlay = {"HERMES_HOME": hermes_home, **dict(_GATEWAY_ENV), "VIRTUAL_ENV": _preserve_hermes_home_path(venv_dir)}
-    _prepend_pythonpath(env_overlay, [_preserve_hermes_home_path(p) for p in (PROJECT_ROOT, *extra_pythonpath)])
+    _prepend_pythonpath(env_overlay, [_preserve_hermes_home_path(p) for p in (_runtime_code_root(PROJECT_ROOT), *extra_pythonpath)])
     return _gateway_run_argv(python_exe, profile_arg), working_dir, env_overlay
 
 
@@ -751,6 +779,13 @@ def windowless_gateway_restart_spec(run_argv: list[str], home: str | None = None
     VIRTUAL_ENV, PYTHONPATH) so the respawn doesn't depend on the watcher's transient working directory.
     ``HERMES_HOME`` is ``home`` when given: a replayed selectorless argv runs on whatever home its
     environment names, so the paused runtime's home, not the updater's, must come back.
+
+    ``PROJECT_ROOT`` is the tree this process imported ``hermes_cli`` from. When that tree is
+    a kanban card workspace, pinning it here would make the respawn RE-PIN the disposable
+    workspace -- so the hijack survives every restart and the card's cleanup breaks the
+    runtime. The respawn therefore pins the deployed checkout (resolved from the
+    installation's own record) instead, and refuses to spawn from a workspace it cannot
+    replace.
     """
     if not run_argv or sys.platform != "win32":
         return run_argv, "", {}
@@ -761,6 +796,8 @@ def windowless_gateway_restart_spec(run_argv: list[str], home: str | None = None
     except Exception:
         return run_argv, "", {}
 
+    code_root = _runtime_code_root(Path(PROJECT_ROOT))
+
     try:
         hermes_home = str(Path(home or _hermes_home()).resolve())
     except Exception:
@@ -768,8 +805,8 @@ def windowless_gateway_restart_spec(run_argv: list[str], home: str | None = None
     env_overlay: dict[str, str] = {"PYTHONIOENCODING": "utf-8", "HERMES_GATEWAY_DETACHED": "1", "VIRTUAL_ENV": str(venv_dir)}
     if hermes_home:
         env_overlay["HERMES_HOME"] = hermes_home
-    _prepend_pythonpath(env_overlay, [str(PROJECT_ROOT), *extra_pythonpath])
-    return [hidden_console_python, *run_argv[1:]], _stable_gateway_working_dir(PROJECT_ROOT), env_overlay
+    _prepend_pythonpath(env_overlay, [str(code_root), *extra_pythonpath])
+    return [hidden_console_python, *run_argv[1:]], _stable_gateway_working_dir(code_root), env_overlay
 
 
 def _spawn_detached(script_path: Path | None = None, home: Path | None = None) -> int:

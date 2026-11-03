@@ -1084,7 +1084,7 @@ def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
     deletion of the Python interpreter/venv this very runtime boots from (a
     delete the agent cannot walk back — the next start fails before any tool
     can run, #58748)."""
-    from agent.runtime_self_protection import command_deletes_runtime
+    from agent.runtime_self_protection import command_deletes_runtime, command_repoints_runtime_root
 
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
@@ -1094,6 +1094,13 @@ def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
     if runtime_target:
         logger.warning("Runtime self-delete block: %s (command: %s)", runtime_target, command[:200])
         return _hardline_block_result(f"recursive/any delete of {runtime_target}", command)
+    # An editable install of a card workspace repoints the runtime's own code root at a
+    # disposable tree: the finder it writes is a sys.meta_path finder, so it wins every
+    # later import, and the card's cleanup deletes the runtime's code with it.
+    repoint = command_repoints_runtime_root(command)
+    if repoint:
+        logger.warning("Runtime code-root repoint block: %s (command: %s)", repoint, command[:200])
+        return _hardline_block_result(repoint, command)
     if sudo_guard:
         is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
         if is_sudo_guess:

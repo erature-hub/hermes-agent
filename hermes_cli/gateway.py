@@ -4524,7 +4524,16 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     _attach_to_host_gateway_or_guard(force=force, replace=replace)
     _guard_supervised_gateway_conflict(force=force)
     _guard_existing_gateway_process_conflict(replace=replace)
-    sys.path.insert(0, str(PROJECT_ROOT))
+    # ``PROJECT_ROOT`` is the tree this process imported ``hermes_cli`` from. When that is a
+    # kanban card workspace, pinning it here would make the gateway serve its runtime from a
+    # disposable tree -- the card's cleanup would then break the running gateway. Pin the
+    # deployed checkout instead; a workspace that cannot be replaced fails closed.
+    from hermes_cli.runtime_code_root import canonical_code_root, is_card_workspace_path
+
+    code_root = PROJECT_ROOT
+    if is_card_workspace_path(code_root):
+        code_root = canonical_code_root()
+    sys.path.insert(0, str(code_root))
     _apply_startup_watchdog_config()
     from hermes_cli.observability.shared_metrics_process import begin_process
     begin_process("gateway")
