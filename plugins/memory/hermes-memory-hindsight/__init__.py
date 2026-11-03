@@ -45,6 +45,7 @@ from ._client import (
     DEFAULT_TIMEOUT,
     HindsightClient,
     HindsightError,
+    SubstrateIdentity,
 )
 from ._namespaces import (
     DEFAULT_NAMESPACE,
@@ -258,6 +259,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._api_key: str = ""
         self._base_url: str = DEFAULT_BASE_URL
         self._timeout: float = DEFAULT_TIMEOUT
+        # The identity verdict for the peer at ``_base_url`` (``None`` before the
+        # first probe). It is kept on the provider so the diagnostics snapshot can
+        # report whether the substrate was VERIFIED, not merely credentialed.
+        self._identity: Optional[SubstrateIdentity] = None
 
         # Commencement recall state: a background recall stages its result here, and the
         # next prefetch() consumes it. One lock, one slot — the newest staged recall wins.
@@ -301,6 +306,24 @@ class HindsightMemoryProvider(MemoryProvider):
             "HINDSIGHT_API_KEY is not set for this profile. Add it to the profile .env "
             "(or the shared Hermes .env) and restart, or run `hermes memory setup "
             "hermes-memory-hindsight`."
+        )
+
+    def identity_warning(self) -> str:
+        """A user-facing note when the peer at the base URL is not the substrate.
+
+        ``unavailable_reason()`` is the framework's "provider unavailable" hint, but
+        it is only consulted when ``is_available()`` is False, and this provider IS
+        available (it holds a credential). The identity refusal is a DIFFERENT
+        failure — the credential is fine, the PEER is wrong — so it needs its own
+        message, or the session silently loses sovereign memory.
+        """
+        verdict = self._identity
+        if verdict is None or verdict.identified:
+            return ""
+        return (
+            f"The peer at {self._base_url} is not the Hindsight substrate "
+            f"({verdict.reason}). No credential was sent and no memory was written. "
+            "Point the provider at the substrate's port, or start the substrate."
         )
 
     def _resolve_api_key(self) -> str:
@@ -443,6 +466,34 @@ class HindsightMemoryProvider(MemoryProvider):
             return
 
         self._client = HindsightClient(self._base_url, self._api_key, timeout=self._timeout)
+
+        # IDENTIFY BEFORE CREDENTIALING. The peer on the configured base URL is
+        # probed WITHOUT the bearer: only a peer that proves it is the Hindsight
+        # substrate may ever receive the credential or a retained transcript.
+        #
+        # This matters because the substrate is a LOCAL service on a fixed port, and
+        # that port can be taken over by an unrelated product (it was: the substrate
+        # was decommissioned on 2026-11-01 and a third-party product took :8888).
+        # Without this gate the provider would hand that product the 51-character
+        # API key AND every "User:/Assistant:" transcript it retained.
+        identity = self._client.identify()
+        self._identity = identity
+        if not identity.identified:
+            logger.warning(
+                "hindsight: %s is not the Hindsight substrate (%s) — sovereign memory is "
+                "inactive and NO credential was sent",
+                self._base_url,
+                identity.reason,
+            )
+            self._client = None
+            self._resolver = None
+            # Surface it on the standard diagnostic surface too, so the session does
+            # not silently lose sovereign memory with only a log line to explain it.
+            warning = self.identity_warning()
+            if warning:
+                logger.warning("hindsight: %s", warning)
+            return
+
         self._resolver = BankResolver(self._client)
         try:
             self._bank_id = self._resolver.ensure_namespace(self._namespace)
@@ -451,10 +502,12 @@ class HindsightMemoryProvider(MemoryProvider):
             self._bank_id = self._namespace
 
         logger.info(
-            "hindsight: sovereign memory ready (bank=%s namespace=%s url=%s)",
+            "hindsight: sovereign memory ready (bank=%s namespace=%s url=%s substrate=%s %s)",
             self._bank_id,
             self._namespace,
             self._base_url,
+            identity.title,
+            identity.version,
         )
         self._request_recall()
 
@@ -1098,7 +1151,18 @@ class HindsightMemoryProvider(MemoryProvider):
             "base_url": self._base_url,
             "budget": self._budget,
             "credentialed": bool(self._api_key),
+            # Whether the peer at base_url PROVED it is the Hindsight substrate. A
+            # credential alone says nothing about the peer: the snapshot must not
+            # read "healthy" for a bank that was never resolved against a verified
+            # substrate.
+            "substrate_identified": bool(self._identity and self._identity.identified),
+            "bound": self._client is not None,
         }
+        if self._identity is not None:
+            snapshot["substrate_title"] = self._identity.title
+            snapshot["substrate_version"] = self._identity.version
+            if not self._identity.identified:
+                snapshot["substrate_reason"] = self._identity.reason
         if self._resolver is not None:
             snapshot["namespaces"] = self._resolver.namespaces()
         return snapshot

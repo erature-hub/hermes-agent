@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,44 @@ DEFAULT_TIMEOUT = 30.0
 RETRY_STATUSES = frozenset({500, 502, 503, 504})
 RETRY_DELAYS = (0.25, 0.75)
 
+#: The OpenAPI document title the substrate publishes. It is the PRODUCT identity of
+#: the peer, not a liveness signal: ``{"status": "healthy"}`` is answered by half the
+#: HTTP servers in the world, while this title is set by the substrate's own app
+#: factory (``FastAPI(title="Hindsight HTTP API")``).
+#:
+#: Matched as a PREFIX so a substrate release that appends to the title still
+#: verifies, while a foreign product ("Unsloth UI Backend") does not. A prefix
+#: match also rejects a title that merely CONTAINS the word, e.g. "Not Hindsight".
+SUBSTRATE_TITLE_PREFIX = "Hindsight"
+
+#: Upper bound on the OpenAPI document the identity probe will read. The substrate's
+#: document is ~340 kB, but the ``info`` block (which carries the title) sits in the
+#: first few hundred bytes, so the probe reads a bounded PREFIX of it. That keeps the
+#: per-probe cost tiny AND stops a peer from making the probe buffer an unbounded body.
+OPENAPI_PROBE_LIMIT = 8 * 1024
+
+#: Timeout for the identity probe. It runs before the provider binds, so it must be
+#: quick: a peer that cannot answer within this window is treated as "not the
+#: substrate" and the bearer is never sent to it.
+IDENTITY_TIMEOUT = 5.0
+
+#: How long an identity verdict stays valid, in seconds.
+#:
+#: The verdict is CACHED so a normal turn does not re-probe, but it is NOT valid
+#: forever: the substrate on a given port can be REPLACED while a session is live
+#: (that is exactly what happened on 2026-11-01, when the substrate was decommissioned
+#: and an unrelated product took the port). Without expiry, a verdict earned against
+#: the substrate would keep authorising a bearer to be sent to whatever now owns the
+#: port. A bounded window turns that from "for the rest of the session" into "for at
+#: most this long".
+IDENTITY_TTL = 60.0
+
+#: How long a REFUSAL (the peer is not the substrate) stays valid, in seconds. It
+#: is short so a substrate that comes back up is picked up again promptly — a
+#: negative verdict blocks sovereign memory, and blocking it for a full minute
+#: after a blip would strand the session.
+NEGATIVE_IDENTITY_TTL = 5.0
+
 
 class HindsightError(RuntimeError):
     """A Hindsight request failed. ``status`` is 0 for transport failures."""
@@ -35,6 +75,147 @@ class HindsightError(RuntimeError):
     def __init__(self, message: str, *, status: int = 0) -> None:
         super().__init__(message)
         self.status = status
+
+
+class SubstrateIdentityError(HindsightError):
+    """The peer on the configured base URL did not identify as the Hindsight substrate.
+
+    Raised BEFORE any credential is attached to a request, so a peer that is not the
+    substrate never receives the bearer and never receives a retained transcript.
+    """
+
+
+@dataclass(frozen=True)
+class SubstrateIdentity:
+    """The verdict of an UNAUTHENTICATED identity probe.
+
+    ``identified`` is True only when the peer proved it IS the Hindsight substrate.
+    """
+
+    identified: bool
+    reason: str = ""
+    title: str = ""
+    version: str = ""
+
+
+def _openapi_identity(raw: bytes) -> tuple[str, str]:
+    """Pull ``(title, version)`` out of an OpenAPI document's ``info`` block.
+
+    The document is read as a PREFIX, so the ``info`` object may be truncated. The
+    parser therefore decodes the ``info`` value on its own (JSON decoder
+    ``raw_decode``) instead of parsing the whole document, and tolerates the
+    truncation by returning what it could decode.
+
+    ``raw_decode`` does NOT skip leading whitespace, so the whitespace between the
+    ``"info"`` key and its value is stripped explicitly -- a document serialised
+    with ``json.dumps`` defaults puts a space there, and the substrate's own
+    document does not.
+    """
+    text = raw.decode("utf-8", "replace")
+    marker = text.find('"info"')
+    if marker < 0:
+        return "", ""
+    colon = text.find(":", marker + len('"info"'))
+    if colon < 0:
+        return "", ""
+    start = colon + 1
+    while start < len(text) and text[start] in " \t\r\n":
+        start += 1
+    try:
+        info, _ = json.JSONDecoder().raw_decode(text, start)
+    except ValueError:
+        return "", ""
+    if not isinstance(info, dict):
+        return "", ""
+    title = str(info.get("title") or "").strip()
+    version = str(info.get("version") or "").strip()
+    return title, version
+
+
+def probe_substrate(
+    base_url: str,
+    *,
+    timeout: float = IDENTITY_TIMEOUT,
+    opener: Any = None,
+) -> SubstrateIdentity:
+    """Ask the peer at *base_url* whether it is the Hindsight substrate.
+
+    Every request here is UNAUTHENTICATED: this probe is what decides whether the
+    bearer may be attached to anything, so attaching it during the probe would
+    defeat the purpose. ``client.health()`` is deliberately NOT reused for this --
+    it routes through ``_request``, which attaches the bearer.
+
+    Two signals are required, and the second is the decisive one:
+
+    1. ``GET /health`` -- the substrate's readiness contract (unauthenticated). It
+       answers ``{"status": "healthy", ...}``. This proves a live peer, but NOT
+       which peer: that shape is generic.
+    2. ``GET /openapi.json`` -- the substrate's published API description
+       (unauthenticated). Its ``info.title`` names the PRODUCT. A different
+       product on the same port cannot pass this, which is the whole point: the
+       configured port may hold an unrelated third-party service, and attaching
+       the bearer to it would hand that service the credential AND every retained
+       transcript.
+
+    This is a guard against MISCONFIGURATION, not an authentication mechanism. A
+    local process that deliberately impersonates the Hindsight substrate can still
+    pass it -- that threat needs mutual TLS or a pinned digest, not an
+    unauthenticated probe.
+    """
+    url = base_url.rstrip("/")
+    opener = opener or urllib.request.urlopen
+
+    def _get(path: str, limit: int | None = None) -> tuple[int, bytes]:
+        """One UNAUTHENTICATED GET. No Authorization header is ever attached."""
+        request = urllib.request.Request(
+            f"{url}{path}", method="GET", headers={"Accept": "application/json"}
+        )
+        try:
+            with opener(request, timeout=timeout) as resp:
+                raw = resp.read(limit) if limit is not None else resp.read()
+                status = int(getattr(resp, "status", 200) or 200)
+            return status, raw
+        except urllib.error.HTTPError as exc:
+            try:
+                return int(exc.code), exc.read()
+            except Exception:  # pragma: no cover - body already consumed
+                return int(exc.code), b""
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise SubstrateIdentityError(f"the peer did not answer: {exc}") from exc
+
+    try:
+        health_status, health_body = _get("/health")
+    except SubstrateIdentityError as exc:
+        return SubstrateIdentity(False, str(exc))
+    if health_status != 200:
+        return SubstrateIdentity(
+            False, f"the peer answered /health with HTTP {health_status}"
+        )
+    try:
+        health = json.loads(health_body.decode("utf-8", "replace") or "{}")
+    except ValueError:
+        return SubstrateIdentity(False, "the peer's /health answer was not JSON")
+    if not isinstance(health, dict) or health.get("status") != "healthy":
+        return SubstrateIdentity(False, "the peer is not reporting a healthy substrate")
+
+    try:
+        spec_status, spec_body = _get("/openapi.json", limit=OPENAPI_PROBE_LIMIT)
+    except SubstrateIdentityError as exc:
+        return SubstrateIdentity(False, str(exc))
+    if spec_status != 200:
+        return SubstrateIdentity(
+            False, f"the peer answered /openapi.json with HTTP {spec_status}"
+        )
+    title, version = _openapi_identity(spec_body)
+    if not title.startswith(SUBSTRATE_TITLE_PREFIX):
+        return SubstrateIdentity(
+            False,
+            f"the peer identifies as {title or 'an unknown product'!r}, "
+            f"not a {SUBSTRATE_TITLE_PREFIX} substrate",
+            title=title,
+            version=version,
+        )
+    return SubstrateIdentity(True, "", title=title, version=version)
 
 
 class HindsightClient:
@@ -59,6 +240,71 @@ class HindsightClient:
         # ``opener`` is injectable so the hermetic test suite can drive a fake transport
         # without binding a socket.
         self._opener = opener or urllib.request.urlopen
+        # The identity verdict, and the time it was earned. ``None`` means "not probed
+        # yet" -- and an unprobed client refuses to send the bearer (see _request).
+        self._identity: Optional[SubstrateIdentity] = None
+        self._identity_at: float = 0.0
+        # The recall worker and the main thread both call into the client, so the
+        # verdict cache is guarded: without it, two threads could probe at once and
+        # a half-written verdict could be observed.
+        self._identity_lock = threading.Lock()
+
+    # -- identity ----------------------------------------------------------------
+
+    def identify(self, *, force: bool = False) -> SubstrateIdentity:
+        """Prove the peer at the base URL IS the Hindsight substrate.
+
+        The probe is UNAUTHENTICATED and its verdict is cached for ``IDENTITY_TTL``
+        seconds. Callers that must not proceed against an unverified peer check
+        ``identity.identified`` and refuse to continue.
+
+        A NEGATIVE verdict is cached only briefly: refusing to talk to a peer for a
+        full minute after it was unreachable would strand sovereign memory for the
+        rest of a session even after the substrate came back. The positive verdict
+        gets the full TTL, because that one authorises sending the credential.
+        """
+        with self._identity_lock:
+            now = time.monotonic()
+            cached = self._identity
+            if (
+                not force
+                and cached is not None
+                and (now - self._identity_at) < self._identity_ttl(cached)
+            ):
+                return cached
+            verdict = probe_substrate(
+                self.base_url,
+                timeout=min(self.timeout, IDENTITY_TIMEOUT),
+                opener=self._opener,
+            )
+            self._identity = verdict
+            self._identity_at = now
+            return verdict
+
+    @staticmethod
+    def _identity_ttl(verdict: SubstrateIdentity) -> float:
+        """How long this verdict stays valid. A refusal expires fast."""
+        return IDENTITY_TTL if verdict.identified else NEGATIVE_IDENTITY_TTL
+
+    def require_substrate(self) -> SubstrateIdentity:
+        """Identify the peer, raising if it is not the Hindsight substrate.
+
+        This is the gate every authenticated call passes through: it raises BEFORE
+        the bearer is attached, so a peer that is not the substrate never receives the
+        credential and never receives a retained transcript.
+        """
+        verdict = self.identify()
+        if not verdict.identified:
+            raise SubstrateIdentityError(
+                f"the peer at {self.base_url} is not the Hindsight substrate "
+                f"({verdict.reason}); no credential was sent"
+            )
+        return verdict
+
+    @property
+    def identity(self) -> Optional[SubstrateIdentity]:
+        """The last identity verdict (``None`` before the first probe)."""
+        return self._identity
 
     # -- plumbing ---------------------------------------------------------------
 
@@ -78,7 +324,16 @@ class HindsightClient:
         params: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
     ) -> Any:
-        """One HTTP call with bounded retry on transient failures; returns parsed JSON."""
+        """One HTTP call with bounded retry on transient failures; returns parsed JSON.
+
+        The bearer is attached ONLY after the peer has been proven to be the
+        Hindsight substrate. This is the single choke point through which every
+        credentialed request passes, so gating HERE (rather than at each call site)
+        means no future call site can leak the credential by forgetting the check.
+        """
+        # Fail closed: an unverified peer never sees the Authorization header, so it
+        # never receives the credential and never receives a retained transcript.
+        self.require_substrate()
         url = self._url(path, params)
         data = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {

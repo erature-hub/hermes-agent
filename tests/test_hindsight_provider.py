@@ -64,8 +64,11 @@ class _FakeResponse:
         self._body = json.dumps(payload).encode("utf-8") if payload is not None else b""
         self.status = status
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, limit: int | None = None) -> bytes:
+        # ``limit`` mirrors ``http.client.HTTPResponse.read(amt)``: the identity
+        # probe reads only a PREFIX of the OpenAPI document so a peer cannot make
+        # it buffer an unbounded body.
+        return self._body if limit is None else self._body[:limit]
 
     def __enter__(self) -> _FakeResponse:
         return self
@@ -300,6 +303,24 @@ def _default_routes(transport: _FakeTransport | None = None) -> dict[str, Any]:
         return {"bank_id": bank_id, "name": record.get("name", "")}
 
     return {
+        # The substrate's UNAUTHENTICATED identity surface. The provider probes
+        # these WITHOUT the bearer before it may attach the credential to anything,
+        # so the fake mirrors them exactly: /health answers the readiness contract,
+        # and /openapi.json names the PRODUCT in its info.title.
+        "GET /health": lambda m, b, p, q: {
+            "status": "healthy",
+            "database": "connected",
+            "db_acquire_ms": 1.0,
+        },
+        "GET /openapi.json": lambda m, b, p, q: {
+            "openapi": "3.1.0",
+            "info": {
+                "title": "Hindsight HTTP API",
+                "description": "HTTP API for Hindsight",
+                "version": "0.10.2",
+            },
+            "paths": {},
+        },
         "GET /v1/default/banks": list_banks,
         # The substrate registers only DELETE/PATCH/PUT on /banks/{bank_id}: a
         # single-bank GET is a 405 route miss. The fake mirrors that so a client
@@ -1474,3 +1495,257 @@ class TestCommencementRecallReachesTheTurn:
         # must NOT raise.
         provider.initialize("sess-1", hermes_home=str(Path(os.environ["HERMES_HOME"])))
         assert provider._client is None
+
+
+# ===========================================================================
+# Substrate identity gate
+# ===========================================================================
+
+
+def _foreign_transport(*, title: str = "Unsloth UI Backend") -> _FakeTransport:
+    """A peer that is healthy but is NOT the Hindsight substrate.
+
+    This is the live threat: the substrate was decommissioned on 2026-11-01 and an
+    unrelated third-party product took over :8888. Such a peer answers /health
+    happily, so a liveness-only check would wave it through.
+    """
+    transport = _FakeTransport()
+    transport.routes.update(_default_routes(transport))
+    transport.routes["GET /openapi.json"] = (
+        lambda m, b, p, q: {
+            "openapi": "3.1.0",
+            "info": {"title": title, "version": "2026.10.11"},
+            "paths": {},
+        }
+    )
+    return transport
+
+
+class TestSubstrateIdentityGate:
+    """The peer must PROVE it is the Hindsight substrate before it gets the bearer.
+
+    The security property under test: a peer that is not the substrate never
+    receives an ``Authorization`` header, and therefore never receives the API key
+    or any retained transcript.
+    """
+
+    def test_no_request_carries_an_authorization_header_when_the_peer_is_not_hindsight(self):
+        """THE regression test for the leak.
+
+        Every request the client makes against a foreign peer is inspected: not one
+        may carry the bearer. The bearer is the 51-character substrate key, and the
+        retained ``User:/Assistant:`` transcripts ride the same requests.
+        """
+        transport = _foreign_transport()
+        client = _make_client(transport, api_key="secret-token")
+
+        with pytest.raises(HindsightError):
+            client.recall("hermes", "hello")
+
+        assert transport.calls, "the probe never reached the peer"
+        for call in transport.calls:
+            assert "authorization" not in call["headers"], (
+                f"the bearer was sent to a peer that is not the Hindsight substrate: {call}"
+            )
+
+    def test_the_probe_itself_never_sends_the_bearer(self):
+        """The identity probe is UNAUTHENTICATED by construction.
+
+        ``client.health()`` cannot be reused for this: it routes through
+        ``_request``, which attaches the bearer -- so probing through it would hand
+        the credential to the very peer being vetted.
+        """
+        transport = _foreign_transport()
+        client = _make_client(transport, api_key="secret-token")
+        client.identify()
+
+        probe_calls = [
+            c for c in transport.calls if c["path"] in ("/health", "/openapi.json")
+        ]
+        assert probe_calls, "the probe made no requests"
+        for call in probe_calls:
+            assert "authorization" not in call["headers"], (
+                f"the identity probe leaked the bearer: {call}"
+            )
+
+    def test_a_foreign_peer_is_refused(self):
+        transport = _foreign_transport()
+        verdict = _make_client(transport).identify()
+        assert verdict.identified is False
+        assert verdict.reason, "a refusal must say why"
+
+    def test_a_healthy_but_foreign_peer_is_still_refused(self):
+        """Liveness alone is NOT identity.
+
+        The foreign peer answers ``/health`` with the substrate's own readiness
+        shape, so a check that only looked at /health would wave it through.
+        """
+        transport = _foreign_transport()
+        client = _make_client(transport)
+        verdict = client.identify()
+        assert verdict.identified is False
+
+        # ...and the peer really did claim to be healthy on the unauthenticated route.
+        health = [c for c in transport.calls if c["path"] == "/health"]
+        assert health, "the foreign peer never answered /health"
+        assert health[0]["method"] == "GET"
+
+    def test_the_real_substrate_is_accepted(self):
+        transport = _transport()
+        verdict = _make_client(transport).identify()
+        assert verdict.identified is True
+        assert verdict.title.startswith("Hindsight")
+        assert verdict.version
+
+    def test_the_bearer_is_sent_once_the_peer_is_identified(self):
+        transport = _transport()
+        client = _make_client(transport, api_key="secret-token")
+        client.recall("hermes", "hello")
+        recall = [c for c in transport.calls if c["path"].endswith("/memories/recall")]
+        assert recall, "the recall never reached the substrate"
+        assert recall[-1]["headers"]["authorization"] == "Bearer secret-token"
+
+    def test_a_dead_peer_is_refused_without_sending_the_bearer(self):
+        """A peer that does not answer at all is not the substrate."""
+        transport = _FakeTransport()
+        transport.routes["GET /health"] = lambda m, b, p, q: (_ for _ in ()).throw(
+            _http_error(503, "Service Unavailable")
+        )
+        client = _make_client(transport, api_key="secret-token")
+        with pytest.raises(HindsightError):
+            client.recall("hermes", "hello")
+        assert all("authorization" not in c["headers"] for c in transport.calls)
+
+    def test_a_peer_that_404s_the_openapi_document_is_refused(self):
+        """The product identity must be PROVEN, not merely absent."""
+        transport = _transport()
+        del transport.routes["GET /openapi.json"]
+        client = _make_client(transport, api_key="secret-token")
+        with pytest.raises(HindsightError):
+            client.recall("hermes", "hello")
+        assert all("authorization" not in c["headers"] for c in transport.calls)
+
+    def test_the_provider_refuses_to_bind_to_a_foreign_peer(self, monkeypatch):
+        """initialize() must leave the provider INACTIVE, not merely unhappy."""
+        transport = _foreign_transport()
+        monkeypatch.setenv("HINDSIGHT_API_KEY", "test-key")
+        _bind_transport(monkeypatch, transport)
+        provider = HindsightMemoryProvider()
+        provider.initialize("sess-1", hermes_home=str(_isolate_home(monkeypatch)))
+        assert provider._client is None, (
+            "the provider bound to a peer that is not the substrate"
+        )
+        assert all("authorization" not in c["headers"] for c in transport.calls)
+
+    def test_the_provider_still_binds_to_the_real_substrate(self, monkeypatch):
+        transport = _transport()
+        monkeypatch.setenv("HINDSIGHT_API_KEY", "test-key")
+        _bind_transport(monkeypatch, transport)
+        provider = HindsightMemoryProvider()
+        provider.initialize("sess-1", hermes_home=str(_isolate_home(monkeypatch)))
+        assert provider._client is not None
+        assert provider._bank_id, "the namespace was not resolved"
+
+    def test_the_identity_verdict_is_cached_for_the_ttl(self):
+        """A turn must not re-probe the substrate on every request."""
+        transport = _transport()
+        client = _make_client(transport)
+        client.identify()
+        probes = len([c for c in transport.calls if c["path"] == "/openapi.json"])
+        client.recall("hermes", "one")
+        client.recall("hermes", "two")
+        assert len([c for c in transport.calls if c["path"] == "/openapi.json"]) == probes
+
+    def test_the_identity_verdict_expires_so_a_replaced_substrate_is_caught(self):
+        """The verdict must not outlive the substrate it was earned against.
+
+        The substrate on a port can be REPLACED while a session is live. Without an
+        expiry, a verdict earned against the real substrate would keep authorising
+        the bearer to be sent to whatever now owns the port.
+        """
+        transport = _transport()
+        client = _make_client(transport)
+        assert client.identify().identified is True
+
+        # The substrate is decommissioned and an unrelated product takes the port.
+        transport.routes["GET /openapi.json"] = (
+            lambda m, b, p, q: {"openapi": "3.1.0", "info": {"title": "Unsloth UI Backend"}}
+        )
+        client._identity_at -= (_client_mod.IDENTITY_TTL + 1.0)
+
+        verdict = client.identify()
+        assert verdict.identified is False, "a stale verdict was reused against a new peer"
+        with pytest.raises(HindsightError):
+            client.recall("hermes", "hello")
+        assert all(
+            "authorization" not in c["headers"]
+            for c in transport.calls
+            if c["path"].endswith("/memories/recall")
+        )
+
+    def test_a_refusal_is_not_cached_for_the_full_ttl(self):
+        """A substrate that comes back up must be picked up again promptly."""
+        transport = _foreign_transport()
+        client = _make_client(transport)
+        assert client.identify().identified is False
+
+        # The substrate is restored on the same port.
+        transport.routes["GET /openapi.json"] = (
+            lambda m, b, p, q: {
+                "openapi": "3.1.0",
+                "info": {"title": "Hindsight HTTP API", "version": "0.10.2"},
+            }
+        )
+        client._identity_at -= (_client_mod.NEGATIVE_IDENTITY_TTL + 1.0)
+        assert client.identify().identified is True
+
+    def test_the_probe_reads_only_a_bounded_prefix_of_the_spec(self):
+        """A peer must not be able to make the probe buffer an unbounded body."""
+        assert _client_mod.OPENAPI_PROBE_LIMIT <= 64 * 1024
+        transport = _transport()
+        client = _make_client(transport)
+        client.identify()
+        assert client.identity is not None
+        assert client.identity.identified is True
+
+    def test_the_diagnostic_snapshot_does_not_read_healthy_for_a_refused_peer(self, monkeypatch):
+        """A refused peer must not be reported as a working substrate.
+
+        The snapshot used to report ``bank`` with a credential present, which read
+        as "healthy" even when nothing had ever been resolved against a verified
+        substrate.
+        """
+        transport = _foreign_transport()
+        monkeypatch.setenv("HINDSIGHT_API_KEY", "test-key")
+        _bind_transport(monkeypatch, transport)
+        provider = HindsightMemoryProvider()
+        provider.initialize("sess-1", hermes_home=str(_isolate_home(monkeypatch)))
+
+        snapshot = provider.get_context()
+        assert snapshot["credentialed"] is True
+        assert snapshot["substrate_identified"] is False
+        assert snapshot["bound"] is False
+        assert snapshot["substrate_reason"], "the refusal must be explained in the snapshot"
+
+    def test_the_identity_refusal_is_reported_to_the_user(self, monkeypatch):
+        """The refusal must not be a log line the user never sees."""
+        transport = _foreign_transport()
+        monkeypatch.setenv("HINDSIGHT_API_KEY", "test-key")
+        _bind_transport(monkeypatch, transport)
+        provider = HindsightMemoryProvider()
+        provider.initialize("sess-1", hermes_home=str(_isolate_home(monkeypatch)))
+
+        warning = provider.identity_warning()
+        assert warning, "an identity refusal produced no user-facing warning"
+        assert "not the Hindsight substrate" in warning
+        assert "No credential was sent" in warning
+
+    def test_a_healthy_substrate_produces_no_identity_warning(self, monkeypatch):
+        transport = _transport()
+        monkeypatch.setenv("HINDSIGHT_API_KEY", "test-key")
+        _bind_transport(monkeypatch, transport)
+        provider = HindsightMemoryProvider()
+        provider.initialize("sess-1", hermes_home=str(_isolate_home(monkeypatch)))
+        assert provider.identity_warning() == ""
+        assert provider.get_context()["substrate_identified"] is True
+        assert provider.get_context()["bound"] is True

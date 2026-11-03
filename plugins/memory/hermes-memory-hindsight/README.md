@@ -91,6 +91,47 @@ A bare owner name (`paul`) is accepted as the ergonomic spelling of `erature/pau
 > canonical bank id it actually addresses. The alias is what makes `erature/<owner>`
 > visible in the substrate (`matched_aliases` on the bank list).
 
+### 5. Substrate identity gate (the credential never reaches a stranger)
+
+Before anything is sent, the peer on the configured `base_url` must **prove it is the
+Hindsight substrate**. The proof is an **unauthenticated** probe of two endpoints:
+
+| Probe | Signal | Why |
+|---|---|---|
+| `GET /health` | `{"status": "healthy", …}` | liveness — but a GENERIC shape |
+| `GET /openapi.json` | `info.title` starts with `Hindsight` | **product identity** — decisive |
+
+Only after both pass is the `Authorization: Bearer …` header attached. The gate sits
+in the transport's single request choke point, so **no call site can leak the
+credential by forgetting the check**.
+
+> **Why this matters, concretely.** The substrate is a *local* service on a fixed
+> port, and that port can be taken over by an unrelated product. It was: the
+> substrate was decommissioned on 2026-11-01 and a third-party product took `:8888`.
+> Without the gate, the provider would have handed that product the API key **and**
+> every `User:/Assistant:` transcript it retained — 4 of 4 requests carried the
+> bearer, and the provider still reported a healthy bank.
+
+> **The probe itself carries no bearer.** `client.health()` cannot be reused for it:
+> that routes through the request path, which attaches the credential — probing
+> through it would hand the secret to the very peer being vetted. The probe reads
+> only a bounded prefix of the OpenAPI document (the `info` block sits in the first
+> few hundred bytes), so a peer cannot make it buffer an unbounded body.
+
+> **The verdict expires.** A positive verdict is cached for 60s and a refusal for 5s.
+> Without expiry, a verdict earned against the real substrate would keep
+> authorising the bearer to be sent to whatever later took the port. A refusal
+> expires quickly so a substrate that comes back up is picked up again.
+
+> **This is a misconfiguration guard, not authentication.** A local process that
+> deliberately impersonates the substrate can still pass it; that threat needs
+> mutual TLS or a pinned digest, not an unauthenticated probe.
+
+When the peer is refused the provider stays **inert** (no recall, no retain, no
+tools) and says so: `identity_warning()` names the peer and the reason, and
+`get_context()` reports `substrate_identified: false` rather than a healthy-looking
+bank.
+
 ## Configuration
 
 Non-secret settings live in `$HERMES_HOME/hermes-memory-hindsight/config.json`
@@ -154,6 +195,13 @@ Live end-to-end verification against the real substrate:
 
 ```bash
 ./.venv/Scripts/python.exe scripts/verify_hindsight_provider.py
+```
+
+Live verification of the identity gate against the real peers (the substrate, and
+whatever unrelated product currently owns the default port):
+
+```bash
+./.venv/Scripts/python.exe scripts/verify_substrate_identity.py
 ```
 
 Read-only checks run against the **real** shared bank (that is where the standing

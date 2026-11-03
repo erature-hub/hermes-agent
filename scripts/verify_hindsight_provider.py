@@ -115,11 +115,52 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    client = _client_mod.HindsightClient(BASE_URL, key, timeout=60)
+    # A recording opener, so the script can PROVE (not assert) that the identity
+    # probe carried no bearer while the credentialed calls did.
+    import urllib.parse
+    import urllib.request
+
+    recorded: list[dict] = []
+
+    def _recording_opener(request, timeout=None):
+        recorded.append(
+            {
+                "path": urllib.parse.urlsplit(request.full_url).path,
+                "headers": {k.lower(): v for k, v in request.header_items()},
+            }
+        )
+        return urllib.request.urlopen(request, timeout=timeout)
+
+    client = _client_mod.HindsightClient(
+        BASE_URL, key, timeout=60, opener=_recording_opener
+    )
+
+    _section("0. substrate identity gate (the peer must PROVE it is Hindsight)")
+    # The gate runs BEFORE the bearer is attached to anything. A peer that is not
+    # the substrate must never receive the credential, so this is checked first and
+    # reported explicitly: a substrate that cannot be identified is not a substrate.
+    identity = client.identify()
+    check(
+        "the peer identifies as the Hindsight substrate",
+        identity.identified,
+        f"title={identity.title!r} version={identity.version!r} reason={identity.reason!r}",
+    )
+    probe_calls = [c for c in recorded if c["path"] in ("/health", "/openapi.json")]
+    check(
+        "the identity probe carried NO bearer",
+        bool(probe_calls) and all("authorization" not in c["headers"] for c in probe_calls),
+        f"{len(probe_calls)} unauthenticated probe calls",
+    )
 
     _section("1. substrate reachability + auth")
     health = client.health()
     check("health reports healthy", health.get("status") == "healthy", json.dumps(health)[:110])
+    credentialed = [c for c in recorded if "authorization" in c["headers"]]
+    check(
+        "a credentialed call DID carry the bearer",
+        bool(credentialed),
+        f"{len(credentialed)} credentialed calls",
+    )
 
     _section("2. provider initializes against the live substrate")
     provider = HindsightMemoryProvider()
