@@ -374,7 +374,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 "secret": True,
                 "required": True,
                 "env_var": "HINDSIGHT_API_KEY",
-                "url": "http://127.0.0.1:8888",
+                "url": "http://127.0.0.1:9999",
             },
             {
                 "key": "base_url",
@@ -473,7 +473,9 @@ class HindsightMemoryProvider(MemoryProvider):
         #
         # This matters because the substrate is a LOCAL service on a fixed port, and
         # that port can be taken over by an unrelated product (it was: the substrate
-        # was decommissioned on 2026-11-01 and a third-party product took :8888).
+        # was decommissioned on 2026-11-01 and a third-party product took :8888;
+        # the substrate was restored on 2026-11-04 at :9999, and :8888 is now
+        # Unsloth Studio -- so the takeover risk is live on every port here).
         # Without this gate the provider would hand that product the 51-character
         # API key AND every "User:/Assistant:" transcript it retained.
         identity = self._client.identify()

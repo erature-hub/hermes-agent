@@ -2,7 +2,7 @@
 
 Proves, against REAL peers on the host:
 
-1. The real Hindsight substrate on :8899 IS identified (title + version).
+1. The real Hindsight substrate on :9999 IS identified (title + version).
 2. The third-party product that took over :8888 (Unsloth Studio) is REFUSED.
 3. Against the foreign peer, NO request carries an Authorization header -- the
    bearer and the retained transcripts never leave.
@@ -30,7 +30,7 @@ HindsightClient = _client_mod.HindsightClient
 HindsightError = _client_mod.HindsightError
 probe_substrate = _client_mod.probe_substrate
 
-SUBSTRATE = "http://127.0.0.1:8899"
+SUBSTRATE = "http://127.0.0.1:9999"
 FOREIGN = "http://127.0.0.1:8888"
 
 failures: list[str] = []
@@ -64,7 +64,7 @@ print("=== 1. the real substrate IS identified")
 opener = _RecordingOpener()
 verdict = probe_substrate(SUBSTRATE, opener=opener)
 check(
-    "the Hindsight substrate on :8899 identifies as Hindsight",
+    "the Hindsight substrate on :9999 identifies as Hindsight",
     verdict.identified,
     f"title={verdict.title!r} version={verdict.version!r} reason={verdict.reason!r}",
 )

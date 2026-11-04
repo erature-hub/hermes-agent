@@ -23,7 +23,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8888"
+DEFAULT_BASE_URL = "http://127.0.0.1:9999"
 DEFAULT_TIMEOUT = 30.0
 # Transient failures only (connection reset / 5xx). 4xx is a contract error: never retried,
 # because retrying a rejected request against a local substrate just burns the turn budget.

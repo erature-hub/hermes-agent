@@ -1190,10 +1190,10 @@ class TestIdentitySignature:
         home = Path(os.environ["HERMES_HOME"])
         (home / PROVIDER_NAME).mkdir(parents=True, exist_ok=True)
         (home / PROVIDER_NAME / "config.json").write_text(
-            json.dumps({"base_url": "http://other.test:8888"}), encoding="utf-8"
+            json.dumps({"base_url": "http://other.test:9999"}), encoding="utf-8"
         )
         signature = HindsightMemoryProvider().identity_signature()
-        assert signature["hermes_memory_hindsight.base_url"] == "http://other.test:8888"
+        assert signature["hermes_memory_hindsight.base_url"] == "http://other.test:9999"
 
     def test_the_signature_is_cheap_and_read_only(self, monkeypatch):
         """The gateway calls this on every inbound message: it must not write."""

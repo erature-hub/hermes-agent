@@ -108,6 +108,7 @@ credential by forgetting the check**.
 > **Why this matters, concretely.** The substrate is a *local* service on a fixed
 > port, and that port can be taken over by an unrelated product. It was: the
 > substrate was decommissioned on 2026-11-01 and a third-party product took `:8888`.
+> It was restored on 2026-11-04 and now answers on `:9999`; `:8888` is Unsloth Studio.
 > Without the gate, the provider would have handed that product the API key **and**
 > every `User:/Assistant:` transcript it retained — 4 of 4 requests carried the
 > bearer, and the provider still reported a healthy bank.
@@ -140,7 +141,7 @@ Non-secret settings live in `$HERMES_HOME/hermes-memory-hindsight/config.json`
 
 | Key | Default | Meaning |
 |---|---|---|
-| `base_url` | `http://127.0.0.1:8888` | substrate base URL |
+| `base_url` | `http://127.0.0.1:9999` | substrate base URL |
 | `namespace` | `hermes` | `hermes` or `erature/<owner>` |
 | `budget` | `mid` | recall budget: `low` / `mid` / `high` |
 | `commitment` | `true` | promote detected decisions into directives |

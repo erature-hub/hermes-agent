@@ -1,7 +1,7 @@
 """LIVE end-to-end verification of the sovereign Hindsight provider.
 
 This script drives the REAL provider against the REAL local Hindsight substrate
-(127.0.0.1:8888) — no fakes. It proves the whole path works: namespace resolution,
+(127.0.0.1:9999) — no fakes. It proves the whole path works: namespace resolution,
 commencement recall, decision/directive retention, the built-in memory mirror, and the
 tool bridge.
 
@@ -45,7 +45,7 @@ _client_mod = importlib.import_module(f"{_PKG}._client")
 HindsightMemoryProvider = _provider.HindsightMemoryProvider
 HindsightError = _client_mod.HindsightError
 
-BASE_URL = os.environ.get("HINDSIGHT_API_URL") or "http://127.0.0.1:8888"
+BASE_URL = os.environ.get("HINDSIGHT_API_URL") or "http://127.0.0.1:9999"
 THROWAWAY_BANK = "sovereign-memory-verify"
 
 
