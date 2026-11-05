@@ -1113,6 +1113,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
         "properties": {
             "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume to schedule; explicit run remains available. Default false."},
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
+            "reason": {"type": "string", "description": "For pause: REQUIRED. Why the job is being paused — stored on the job as 'paused_reason' so the pause is auditable later (a pause with no reason is refused, because a silent pause is indistinguishable from a job that simply stopped firing)."},
             "action": {
                 "type": "string",
                 "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."

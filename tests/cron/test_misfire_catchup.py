@@ -108,7 +108,7 @@ class TestFireOverdueJobs:
 
         job = create_job(prompt="p", schedule="every 1h")
         _park_in_past(job["id"], minutes=30)
-        pause_job(job["id"])
+        pause_job(job["id"], reason="operator hold")
         assert fire_overdue_jobs(RecordingProvider()) == 0
 
     def test_fresh_external_claim_wins(self, tmp_cron_dir):

@@ -873,7 +873,12 @@ def cron_edit(args):
     return 0
 
 
-def _job_action(action: str, job_id: str, success_verb: str) -> int:
+def _job_action(
+    action: str,
+    job_id: str,
+    success_verb: str,
+    reason: Optional[str] = None,
+) -> int:
     _stateless_token = None
     if action == "run":
         # One-shot CLI: a background-dispatched run (daemon thread, triggered when the CLI
@@ -887,8 +892,11 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
             # instead. See #86721.
             from gateway.session_context import _SESSION_ASYNC_DELIVERY
             _stateless_token = _SESSION_ASYNC_DELIVERY.set(False)
+    api_kwargs: dict[str, Any] = {"action": action, "job_id": job_id}
+    if reason is not None:
+        api_kwargs["reason"] = reason
     try:
-        result = _cron_api(action=action, job_id=job_id)
+        result = _cron_api(**api_kwargs)
     finally:
         if _stateless_token is not None:
             _SESSION_ASYNC_DELIVERY.reset(_stateless_token)
@@ -920,6 +928,45 @@ def _run_outcome(job: dict[str, Any]) -> str:
     if job.get("executed"):
         return f"Ran now: {'succeeded' if job.get('execution_success') else 'failed'}."
     return job.get("execution_skipped") or "It will run on the next scheduler tick."
+
+
+def _is_interactive_terminal() -> bool:
+    """True when stdin AND stdout are both a TTY — a human is at the keyboard."""
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _prompt_pause_reason() -> str:
+    """Ask for a pause reason ONLY on an interactive terminal.
+
+    A non-TTY caller (a cron run, a script, a pipeline) must pass ``--reason`` explicitly:
+    prompting there would either block on a closed stdin or invent a reason nobody typed.
+    """
+    if not _is_interactive_terminal():
+        return ""
+    try:
+        entered = input("Reason for pausing (stored on the job as paused_reason): ")
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    return str(entered or "").strip()
+
+
+def cron_pause(args) -> int:
+    """Pause a job. A reason is MANDATORY — the job record must say why it stopped.
+
+    A pause with no recorded reason is indistinguishable, weeks later, from a job that simply
+    stopped firing; the writer refuses one (see ``cron.jobs.PAUSE_REASON_REQUIRED_ERROR``).
+    """
+    reason = str(getattr(args, "reason", None) or "").strip()
+    if not reason:
+        reason = _prompt_pause_reason()
+    if not reason:
+        print(color("A pause reason is required.", Colors.RED))
+        print('  Pass --reason "..." — it is stored on the job as paused_reason so the pause is auditable.')
+        return 1
+    return _job_action("pause", args.job_id, "Paused", reason=reason)
 
 
 def cron_resume(args) -> int:
@@ -1002,7 +1049,7 @@ _CRON_SUBCOMMANDS = {
     "notepad": lambda a: cron_notepad(a),
     "create": lambda a: cron_create(a),
     "edit": lambda a: cron_edit(a),
-    "pause": lambda a: _job_action("pause", a.job_id, "Paused"),
+    "pause": lambda a: cron_pause(a),
     "resume": lambda a: cron_resume(a),
     "run": lambda a: _job_action("run", a.job_id, "Triggered"),
     "remove": lambda a: _job_action("remove", a.job_id, "Removed"),

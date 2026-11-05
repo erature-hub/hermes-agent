@@ -478,6 +478,15 @@ EMPTY_PAYLOAD_ERROR = (
     "skill(s) are set. Provide a prompt, a script, or at least one skill."
 )
 
+# A pause without a recorded reason is indistinguishable, weeks later, from a job that simply
+# stopped firing: the Nov-1 hindsight teardown paused every hindsight cron with a null
+# ``paused_reason`` and nothing on disk said why. The writer is the only chokepoint every door
+# (CLI, agent tool, dashboard, REST API) shares, so the requirement lives here.
+PAUSE_REASON_REQUIRED_ERROR = (
+    "Pausing a cron job requires a reason: it is stored on the job as 'paused_reason' so the "
+    "pause is auditable later. Pass one (CLI: --reason \"...\"; agent tool: reason=\"...\")."
+)
+
 
 def job_payload_is_empty(job: dict[str, Any]) -> bool:
     """True when a job record has nothing runnable (blank prompt, no script, no skills) AND at
@@ -2103,6 +2112,24 @@ def _fill_missing_next_run(updated: dict[str, Any]) -> None:
     updated["next_run_at"] = next_run
 
 
+def _require_pause_reason(job: dict[str, Any], updated: dict[str, Any]) -> None:
+    """Refuse an enabled -> disabled flip that carries no ``paused_reason``.
+
+    Only the FLIP is guarded: a record that was already disabled keeps whatever reason it
+    already had, and re-enabling (resume) clears the pause markers. A completed one-shot is
+    retired through ``_complete_job_record`` (an in-place record update, not this writer), so
+    the guard never fires on a normal completion.
+    """
+    was_enabled = job.get("enabled", True) is not False
+    now_disabled = updated.get("enabled", True) is False
+    if not (was_enabled and now_disabled):
+        return
+    reason = updated.get("paused_reason")
+    if isinstance(reason, str) and reason.strip():
+        return
+    raise ValueError(PAUSE_REASON_REQUIRED_ERROR)
+
+
 def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # ``id`` is a path component under OUTPUT_DIR — changing it would leak path-escape values.
@@ -2115,6 +2142,7 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        _require_pause_reason(job, updated)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
@@ -2159,7 +2187,12 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
 
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, Any]]:
-    """Pause a job without deleting it. Accepts a job ID or name."""
+    """Pause a job without deleting it. Accepts a job ID or name.
+
+    ``reason`` is REQUIRED: the writer refuses an enabled -> disabled flip whose
+    ``paused_reason`` is empty, so a pause always leaves an auditable trail. Raises
+    ValueError when no reason is supplied.
+    """
     job = resolve_job_ref(job_id)
     if not job:
         return None

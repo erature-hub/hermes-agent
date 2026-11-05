@@ -282,12 +282,29 @@ class TestPauseJob:
             ), patch(
                 f"{_MOD}._cron_pause", mock_pause
             ):
-                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
+                resp = await cli.post(
+                    f"/api/jobs/{VALID_JOB_ID}/pause", json={"reason": "outage freeze"})
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == paused_job
                 assert data["job"]["enabled"] is False
-                mock_pause.assert_called_once_with(VALID_JOB_ID)
+                mock_pause.assert_called_once_with(VALID_JOB_ID, reason="outage freeze")
+
+    @pytest.mark.asyncio
+    async def test_pause_job_without_reason_is_refused(self, adapter):
+        """A pause with no reason is refused (400) — the job must say why it stopped."""
+        app = _create_app(adapter)
+        mock_pause = MagicMock(return_value={**SAMPLE_JOB, "enabled": False})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_pause", mock_pause
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
+                assert resp.status == 400
+                assert "reason" in (await resp.json())["error"].lower()
+                mock_pause.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

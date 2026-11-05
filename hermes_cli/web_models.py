@@ -350,6 +350,16 @@ class CronJobCreate(BaseModel):
 class CronJobUpdate(BaseModel):
     updates: dict
 
+
+class CronJobPause(BaseModel):
+    """Optional body for POST /api/cron/jobs/{job_id}/pause.
+
+    ``reason`` is stored on the job as ``paused_reason``. When the client sends none, the
+    dashboard door records a default that names itself (see ``DASHBOARD_PAUSE_REASON``) — a
+    pause never lands on a job with an empty reason.
+    """
+    reason: Optional[str] = None
+
 class AutomationBlueprintInstantiate(BaseModel):
     blueprint: str  # blueprint key, e.g. "morning-brief"
     values: dict[str, Any] = {}  # filled slot values from the form
