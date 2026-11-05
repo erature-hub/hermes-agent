@@ -473,19 +473,22 @@ class TestCronUnavailable:
         app = _create_app(adapter)
         captured = {}
 
-        def _plain_pause(job_id):
+        def _plain_pause(job_id, reason=None):
             captured["job_id"] = job_id
+            captured["reason"] = reason
             return SAMPLE_JOB
 
         async with TestClient(TestServer(app)) as cli:
             with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
                 f"{_MOD}._cron_pause", _plain_pause
             ):
-                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
+                resp = await cli.post(
+                    f"/api/jobs/{VALID_JOB_ID}/pause", json={"reason": "operator hold"})
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == SAMPLE_JOB
                 assert captured["job_id"] == VALID_JOB_ID
+                assert captured["reason"] == "operator hold"
 
     @pytest.mark.asyncio
     async def test_list_handler_no_self_binding(self, adapter):
