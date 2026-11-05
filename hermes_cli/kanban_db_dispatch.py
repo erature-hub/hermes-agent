@@ -26,6 +26,9 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_worker_exit import (
+    PREBIND_TIMEOUT_EXIT_CODE, _DeadWorker, _classify_dead_worker,
+)
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -142,6 +145,9 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    prebind_timeout: list[str] = field(default_factory=list)
+    """Task ids whose attempt never bound its claim inside its handshake deadline:
+    the claim was released and NO failure counted — a host fault, not the card's."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -249,6 +255,10 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("clean_exit", 0)
     if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
         return ("rate_limited", code)
+    if code == PREBIND_TIMEOUT_EXIT_CODE:
+        # The attempt never bound its claim: a host that could not boot a worker in time is
+        # not a card that failed, so ``kanban_worker_exit`` books a claim release instead.
+        return ("prebind_timeout", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
     return ("nonzero_exit", code)
@@ -1036,123 +1046,13 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
 
 
 @dataclass
-class _DeadWorker:
-    """How ``detect_crashed_workers`` should book one dead worker."""
-
-    kind: str
-    code: Optional[int]
-    error_text: str
-    event_kind: str
-    event_payload: dict
-    protocol_violation: bool = False
-    rate_limited: bool = False
-    terminal_provider: bool = False
-    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
-    credential/model — trips the breaker on this first occurrence."""
-
-    @property
-    def run_outcome(self) -> str:
-        # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
-
-
-def _classify_dead_worker(
-    pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
-    board: Optional[str] = None,
-) -> _DeadWorker:
-    """Map a dead worker's reaped exit status to its reclaim bookkeeping.
-
-    A clean exit or a crash carries the worker's own last output (``worker_output``
-    in the event payload, appended to the error text) so the board and the retry
-    worker see WHY instead of a bare label; a rate-limited requeue does not need it.
-    """
-    dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
-    if task_id and not dead.rate_limited:
-        worker_output = _worker_final_output(task_id, board=board)
-        if worker_output:
-            dead.error_text += f"{WORKER_OUTPUT_SEP}{worker_output!r}"
-            dead.event_payload["worker_output"] = worker_output
-    return dead
-
-
-def _classify_dead_worker_exit(
-    pid: int,
-    claimer: Optional[str],
-    exit_code=None,
-    *,
-    task_id: Optional[str] = None,
-    board: Optional[str] = None,
-) -> _DeadWorker:
-    """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
-
-    ``exit_code`` is the authority's exact-run result for a managed worker (a child of the
-    profile owner, never of this dispatcher, so it cannot be reaped here). Otherwise the reap
-    registry only knows children of THIS process; a per-tick dispatcher reads the exit trailer
-    the worker left in its log instead, so the same death gets the same booking (protocol
-    violation / rate-limit requeue / crash) as under the gateway-embedded dispatcher. A worker
-    that never reached its exit epilogue (killed, OOM) leaves no trailer and stays a plain crash.
-    """
-    kind, code = _classify_worker_exit(pid)
-    if exit_code is not None:
-        kind, code = _exit_code_kind(int(exit_code))
-    elif kind == "unknown" and task_id:
-        logged = _worker_log_exit_code(task_id, board=board)
-        if logged is not None:
-            kind, code = _exit_code_kind(logged)
-    if kind == "clean_exit":
-        # rc=0 while still ``running``: usually the work succeeded and only the
-        # paperwork was skipped; the corrective sentence reaches the retry
-        # worker via ``build_worker_context``.
-        return _DeadWorker(
-            kind, code, _PROTOCOL_VIOLATION_ERROR, "protocol_violation",
-            # ``protocol_violation`` is the durable marker for
-            # _protocol_violation_streak: _end_run copies this payload into the
-            # run metadata.
-            {"pid": pid, "claimer": claimer, "exit_code": code, "protocol_violation": True},
-            protocol_violation=True,
-        )
-    if kind == "rate_limited":
-        # Quota wall — NOT a task failure. Release to the source phase and do
-        # NOT count a failure so a long quota window can't trip the breaker.
-        return _DeadWorker(
-            kind, code,
-            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
-            "rate_limited",
-            {"pid": pid, "claimer": claimer, "exit_code": code},
-            rate_limited=True,
-        )
-    if kind == "terminal_provider":
-        # The worker classified its own provider failure as unhealable (credential
-        # revoked, model gone): every further spawn would hit the same wall, so
-        # ``_account_crashes`` trips the breaker now instead of after ``failure_limit``.
-        return _DeadWorker(
-            kind, code,
-            f"pid {pid} exited on a terminal provider error (exit {code}): the provider rejected "
-            "this profile's credential or model — fix the configuration, then unblock.",
-            "crashed",
-            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "terminal_provider": True},
-            terminal_provider=True,
-        )
-    if kind == "nonzero_exit":
-        error_text = f"pid {pid} exited with code {code}"
-    elif kind == "signaled":
-        error_text = f"pid {pid} killed by signal {code}"
-    else:
-        error_text = f"pid {pid} not alive"
-    event_payload = {"pid": pid, "claimer": claimer}
-    if code is not None and kind != "unknown":
-        event_payload["exit_kind"] = kind
-        event_payload["exit_code"] = code
-    return _DeadWorker(kind, code, error_text, "crashed", event_payload)
-
-
-@dataclass
 class _CrashSweep:
     """Everything ``detect_crashed_workers`` collects inside its reclaim txn."""
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    prebind_timeout: list[str] = field(default_factory=list)
+    """Released uncounted: the attempt never bound its claim before its deadline."""
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1221,7 +1121,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.prebind_timeout or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1233,6 +1133,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.prebind_timeout:
+                sweep.prebind_timeout.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1327,7 +1229,8 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     Clean exit while ``running`` is a protocol violation with a bounded
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
     wall, released WITHOUT counting a failure and surfaced via the
-    ``_last_rate_limited`` attribute (the return stays crashed-only).
+    ``_last_rate_limited`` attribute (the return stays crashed-only); a pre-bind deadline
+    miss is released the same way and surfaced via ``_last_prebind_timeout``.
     """
     sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
@@ -1337,6 +1240,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_prebind_timeout = sweep.prebind_timeout  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1561,6 +1465,8 @@ def check_respawn_guard(
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
+    ``"prebind_timeout_cooldown"`` (latest run never bound its claim within its
+    handshake deadline and was released uncounted; also never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
@@ -1600,6 +1506,13 @@ def check_respawn_guard(
             ended_at = _kb._to_epoch(latest_run["ended_at"])
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
+    # A pre-bind timeout is the host's cost, not the card's: it was released without touching
+    # ``consecutive_failures``, so space the retries here instead — otherwise every tick
+    # re-spawns a boot the machine cannot currently afford.
+    if latest_run is not None and latest_run["outcome"] == "prebind_timeout":
+        ended_at = _kb._to_epoch(latest_run["ended_at"])
+        if rl_cooldown > 0 and ended_at is not None and (now - ended_at) < rl_cooldown:
+            return "prebind_timeout_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
@@ -1619,7 +1532,7 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if err and latest_outcome not in ("crashed", "prebind_timeout") and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -2228,6 +2141,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.prebind_timeout.extend(getattr(detect_crashed_workers, "_last_prebind_timeout", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

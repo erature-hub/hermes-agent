@@ -15,6 +15,8 @@ import sys
 import time
 from typing import Optional
 
+from hermes_cli.kanban_worker_exit import PREBIND_TIMEOUT_EXIT_CODE
+
 # A worker that loses its owner (a dropped socket, a restart, `hermes update` draining it or a new
 # owner still starting) waits for it instead of exiting: the condition is the host's, not the card's,
 # and a failed exit here spends the card's failure budget and lets the owner end the turn. Asking
@@ -35,6 +37,21 @@ _RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_contro
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
 
+# A managed worker's boot is the OWNER's cost, and on this host it is a heavy one: a cold PM
+# dependency probe alone measured 17.9 s, and a gateway-env boot 82-107 s. The owner's own hello
+# deadline is derived from that baseline, so a fixed client-side budget would fire FIRST and cut a
+# boot that was going to make it -- booking the card a crash for being slow. Scale with what the
+# host has actually been paying: the p90 of recent ``owner_admitted`` -> ``worker_bound`` gaps on
+# this board, floored by the platform prior and capped so one pathological boot cannot park a card
+# behind a twenty-minute wait.
+SPAWN_BASELINE_PRIORS_S = {'win32': 90.0, 'darwin': 45.0}
+SPAWN_BASELINE_DEFAULT_S = 30.0
+SPAWN_BASELINE_CEILING_S = 300.0
+SPAWN_BASELINE_SAMPLES = 20
+SPAWN_BASELINE_WINDOW_S = 24 * 3600
+# How often the owner-answered receipt loop re-reads the board to see whether the attempt bound.
+BIND_PROBE_S = 2.0
+
 
 def admission_answer_budget():
     """Seconds to wait for ``kanban.run``'s answer: the longest the owner's admission write can
@@ -43,6 +60,184 @@ def admission_answer_budget():
     from hermes_cli import kanban_db_connect
     lock_wait = (kanban_db_connect._BUSY_MAX_RETRIES + 1) * kanban_db_connect._resolve_busy_timeout_ms() / 1000
     return lock_wait + ADMISSION_ANSWER_MARGIN_S
+
+
+class PreBindTimeout(RuntimeError):
+    """The attempt ended before anything about the card ran.
+
+    Not a ``GatewayClientError``: those are the owner's answer about the attempt, while this is
+    the board's verdict that there was never an attempt to answer for. ``_submit`` turns it into
+    ``PREBIND_TIMEOUT_EXIT_CODE``, which the dispatcher books as a claim release instead of a
+    crash -- a host too slow to boot a worker must stop spending the card's failure budget.
+    """
+
+    def __init__(self, message, *, elapsed, deadline, reason=''):
+        super().__init__(message)
+        self.elapsed = float(elapsed)
+        self.deadline = float(deadline)
+        self.reason = reason
+
+    def diagnostic(self):
+        """The one line the dispatcher surfaces as the run's last output: what missed, by how much."""
+        why = f'; owner said {self.reason}' if self.reason else ''
+        return (f'PreBindTimeout: worker boot took {self.elapsed:.0f}s > {self.deadline:.0f}s '
+                f'(no worker_bound for this run; claim released, no failure counted{why})')
+
+
+def spawn_baseline_prior(platform=None):
+    """The cold-boot prior for *platform*, as data so a test never has to fake the host."""
+    return SPAWN_BASELINE_PRIORS_S.get(platform or sys.platform, SPAWN_BASELINE_DEFAULT_S)
+
+
+def _spawn_gaps(board_db):
+    """Recent ``owner_admitted`` -> ``worker_bound`` gaps in seconds on this board, newest first.
+
+    The board is the only durable witness of how long a boot actually took here, and the window
+    is anchored on the board's own clock (its newest bind), not this process's: a worker spawned
+    minutes later still reads "recent" as the board means it. Any read failure yields ``[]`` --
+    an unreadable board must never invent a deadline.
+    """
+    import sqlite3
+    try:
+        uri = str(Path(board_db).resolve().as_uri()) + '?mode=ro'
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            # Newest-first on the rowid: a bounded backward scan instead of a full-table MAX.
+            since_row = conn.execute(
+                'SELECT created_at FROM task_events WHERE kind = ? ORDER BY id DESC LIMIT 1',
+                ('worker_bound',)).fetchone()
+            since = since_row[0] if since_row else None
+            if since is None:
+                return []
+            rows = conn.execute(
+                'SELECT b.created_at - a.created_at AS gap FROM task_events b '
+                'JOIN task_events a ON a.run_id = b.run_id AND a.kind = ? '
+                'WHERE b.kind = ? AND b.run_id IS NOT NULL AND b.created_at >= ? '
+                'ORDER BY b.created_at DESC LIMIT ?',
+                ('owner_admitted', 'worker_bound', int(since) - SPAWN_BASELINE_WINDOW_S,
+                 SPAWN_BASELINE_SAMPLES)).fetchall()
+            return [float(row[0]) for row in rows if row[0] is not None and row[0] >= 0]
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        # A busy, missing, legacy or half-written board is not evidence of anything: fall back
+        # to the prior rather than guessing how long a boot took.
+        return []
+
+
+def spawn_baseline(board_db=None):
+    """This host's typical cold-boot cost: the p90 of its recent bind gaps, floored and capped.
+
+    p90 rather than the median: a deadline drawn from the *typical* boot ignores exactly the slow
+    ones that time out, and ``handshake_deadline`` doubles it for headroom.
+    """
+    gaps = sorted(_spawn_gaps(board_db)) if board_db else []
+    observed = gaps[max(0, (len(gaps) * 9) // 10 - 1)] if gaps else 0.0
+    return min(SPAWN_BASELINE_CEILING_S, max(spawn_baseline_prior(), observed))
+
+
+def owner_hello_deadline():
+    """The owner's own hello deadline, so this client never cuts a boot the owner still allows.
+
+    A client budget tighter than the owner's is the same bug wearing the other hat: the owner
+    waits for its child while this process declares the boot dead. Imported lazily and forgivingly
+    -- the worker's startup path must not pull the gateway in, and an install without it (or a
+    test double) simply contributes nothing.
+    """
+    try:
+        from gateway.session_managed_worker import HELLO_SECONDS
+    except (ImportError, AttributeError):
+        # Not installed (or not a version that has it): no opinion, the baseline stands alone.
+        return 0.0
+    return float(HELLO_SECONDS)
+
+
+def handshake_deadline(board_db=None):
+    """How long a boot may take before it is a pre-bind timeout.
+
+    ``max(OWNER_WAIT_S, owner_hello_deadline, 2 * spawn_baseline)``: never tighter than the budget
+    every owner answer already had, never tighter than the deadline the owner itself grants its
+    child, and twice what this host has been paying so one slow boot is absorbed rather than
+    charged to the card.
+    """
+    return max(OWNER_WAIT_S, owner_hello_deadline(), spawn_baseline(board_db) * 2.0)
+
+
+def _attempt_evidence(board_db, run_id):
+    """``(spawned_at, bound_at, lost_reason)`` for *run_id*, read from the board.
+
+    ``spawned_at`` is the run's own start (written when the dispatcher fired us), ``bound_at`` the
+    ``worker_bound`` a bound interpreter writes under its claim, and ``lost_reason`` whatever the
+    owner recorded when its managed worker died. ``(None, None, '')`` when the board is unreadable
+    or the run unknown: missing evidence must never become a verdict.
+    """
+    if run_id is None:
+        return (None, None, '')
+    import json
+    import sqlite3
+    try:
+        uri = str(Path(board_db).resolve().as_uri()) + '?mode=ro'
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            row = conn.execute(
+                'SELECT started_at FROM task_runs WHERE id = ?', (int(run_id),)).fetchone()
+            started_at = float(row[0]) if row and row[0] is not None else None
+            bound = conn.execute(
+                'SELECT created_at FROM task_events WHERE run_id = ? AND kind = ? '
+                'ORDER BY id DESC LIMIT 1', (int(run_id), 'worker_bound')).fetchone()
+            lost = conn.execute(
+                'SELECT payload FROM task_events WHERE run_id = ? AND kind = ? '
+                'ORDER BY id DESC LIMIT 1', (int(run_id), 'worker_lost')).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        # An unreadable board cannot prove an attempt never bound, so it must not condemn one.
+        return (None, None, '')
+    reason = ''
+    if lost and lost[0]:
+        try:
+            reason = str((json.loads(lost[0]) or {}).get('reason') or '')
+        except (TypeError, ValueError, AttributeError):
+            reason = ''
+    return (started_at, float(bound[0]) if bound else None, reason)
+
+
+def _unbound_elapsed(params, board_db):
+    """``(seconds_since_spawn, owner_reason)`` when NOTHING bound this run, else ``None``.
+
+    ``None`` is "cannot prove": no run id, an unreadable board, an unknown run, or a
+    ``worker_bound`` event -- in each case the attempt's own exit speaks, not this deadline.
+    """
+    started_at, bound_at, reason = _attempt_evidence(board_db, params.get('run_id'))
+    if bound_at is not None or started_at is None:
+        return None
+    return (time.time() - started_at, reason)
+
+
+def _overdue_prebind(params, board_db, deadline):
+    """The ``PreBindTimeout`` for a boot that is still unbound past *deadline*, else ``None``."""
+    unbound = _unbound_elapsed(params, board_db)
+    if unbound is None or unbound[0] < deadline:
+        return None
+    elapsed, reason = unbound
+    return PreBindTimeout(
+        f'Kanban pre-bind deadline missed: nothing bound this run in {elapsed:.0f}s',
+        elapsed=elapsed, deadline=deadline, reason=reason)
+
+
+def _settled_prebind(params, board_db, deadline):
+    """The ``PreBindTimeout`` for a receipt that settled with nothing bound, else ``None``.
+
+    No elapsed floor: the owner may give up on its own (shorter) hello deadline well before ours,
+    and the settlement is proof the attempt is over, so the deadline only supplies context.
+    """
+    unbound = _unbound_elapsed(params, board_db)
+    if unbound is None:
+        return None
+    elapsed, reason = unbound
+    return PreBindTimeout(
+        f'Kanban attempt settled without binding: {elapsed:.0f}s after spawn, no worker_bound',
+        elapsed=elapsed, deadline=deadline, reason=reason)
 
 
 @dataclass
@@ -67,6 +262,10 @@ async def run(params, board_db):
     # wait is bounded from the owner's last answer: an owner that keeps answering keeps the
     # worker, and one that stays silent for ``OWNER_WAIT_S`` fails the worker honestly.
     claim = _Claim(answered=time.monotonic())
+    # Never tighter than the answer budgets above, and longer when this host has been paying a
+    # slow boot: the owner's own hello deadline is derived from the same baseline, so a fixed
+    # budget here would cut a boot that was going to make it.
+    deadline = handshake_deadline(board_db)
     failures = 0
     while True:
         seen = claim.answered
@@ -77,7 +276,7 @@ async def run(params, board_db):
                 # reader stops, with the next receipt behind it.
                 drain = asyncio.create_task(_discard(client.events))
                 try:
-                    receipt = await _await_receipt(client, params, board_db, claim)
+                    receipt = await _await_receipt(client, params, board_db, claim, deadline=deadline)
                 finally:
                     drain.cancel()
         # A restart also surfaces as a refused or reset dial, a failed handshake, or an answer
@@ -85,11 +284,17 @@ async def run(params, board_db):
         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
             if not _restartable(exc):
                 raise
-            if claim.silent_for() >= OWNER_WAIT_S:
+            if claim.silent_for() >= deadline:
                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
                     f' (HTTP {status})' if status else '')
+                # Past the deadline, silence is a boot that never happened only while the board
+                # holds no ``worker_bound`` for this run; a bound attempt is a live turn, and
+                # failing it loudly is still the honest answer.
+                timeout = _overdue_prebind(params, board_db, deadline)
+                if timeout is not None:
+                    raise timeout from exc
                 raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
         else:
             return _exit_code(receipt, params, board_db)
@@ -114,9 +319,14 @@ async def _discard(events):
         await events.get()
 
 
-async def _await_receipt(client, params, board_db, claim):
+async def _await_receipt(client, params, board_db, claim, *, deadline=OWNER_WAIT_S):
     """Submit the claim (or, on a later connection, re-read the admission it got) and return its
-    settled receipt, recording each owner answer on *claim*."""
+    settled receipt, recording each owner answer on *claim*.
+
+    An answering owner keeps the attempt alive indefinitely, so the boot itself needs a bound:
+    every ``BIND_PROBE_S`` the board is asked whether this run bound, and a boot still unbound
+    past *deadline* ends here as a ``PreBindTimeout`` instead of a turn nobody can account for.
+    """
     if claim.admission_id is None:
         db = str(await asyncio.to_thread(Path(board_db).resolve))
         # The owner answers only after it checks the claim and writes its ``owner_admitted`` marker
@@ -133,10 +343,16 @@ async def _await_receipt(client, params, board_db, claim):
     else:
         receipt = await _receipt(client, claim)
     claim.answered = time.monotonic()
+    probe_at = time.monotonic()
     while receipt['status'] not in {'terminal', 'unknown'}:
         await asyncio.sleep(.2)
         receipt = await _receipt(client, claim)
         claim.answered = time.monotonic()
+        if time.monotonic() - probe_at >= BIND_PROBE_S:
+            probe_at = time.monotonic()
+            timeout = _overdue_prebind(params, board_db, deadline)
+            if timeout is not None:
+                raise timeout
     return receipt
 
 
@@ -144,6 +360,12 @@ def _exit_code(receipt, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
     if receipt['status'] == 'unknown':
         raise GatewayClientError('Kanban execution unknown; retained by owner')
+    # A settlement with no ``worker_bound`` behind it is the host's answer, not the card's: the
+    # attempt died in its boot (the owner's hello deadline, an OOM-killed child) and the empty
+    # turn's exit code would book a ``crashed`` that spends the card's retry budget.
+    timeout = _settled_prebind(params, board_db, handshake_deadline(board_db))
+    if timeout is not None:
+        raise timeout
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
@@ -181,6 +403,11 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
+    except PreBindTimeout as exc:
+        # The dispatcher reads this as the run's last output and books the exit as a claim
+        # release: name the deadline that was missed instead of exiting 1 with no message.
+        print(exc.diagnostic(), file=sys.stderr)
+        return PREBIND_TIMEOUT_EXIT_CODE
     except (KeyError, ValueError, OSError) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1
