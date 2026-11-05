@@ -23,7 +23,12 @@ from hermes_cli.config import cfg_get
 from hermes_cli.web_server_cron import (
     _create_cron_job_sync, _cron_optional_text, _cron_string_list, _mutate_cron_for_profile, _normalize_dashboard_cron_script, _raise_if_cron_registration_error, _run_cron_dashboard_io, _validate_dashboard_cron_context_from, _validate_dashboard_cron_effective_job,
 )
-from hermes_cli.web_models import AutomationBlueprintInstantiate, CronJobCreate, CronJobUpdate
+from hermes_cli.web_models import (
+    AutomationBlueprintInstantiate,
+    CronJobCreate,
+    CronJobPause,
+    CronJobUpdate,
+)
 from hermes_cli.web_routers._common import log as _log
 from hermes_time import get_timezone as _get_timezone
 from hermes_state_keys import legacy_cron_run_job
@@ -651,8 +656,19 @@ def _update_cron_job_sync(job_id: str, body: CronJobUpdate, profile: Optional[st
     return _found(job)
 
 
-def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None):
-    return _found(_mutate_cron_for_profile(_job_profile(job_id, profile), "pause_job", job_id))
+# The dashboard pause button is a one-click human action, but the writer refuses a pause that
+# carries no reason at all (a silent pause is indistinguishable from a job that simply stopped
+# firing). The door therefore supplies a default that names itself — an auditable "who/where",
+# even when the human did not type a "why". A client that wants to record a real why posts
+# {"reason": "..."}.
+DASHBOARD_PAUSE_REASON = "Paused from the Hermes dashboard (no reason supplied)"
+
+
+def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None,
+                         reason: Optional[str] = None):
+    selected = _job_profile(job_id, profile)
+    return _found(_mutate_cron_for_profile(
+        selected, "pause_job", job_id, reason=(reason or DASHBOARD_PAUSE_REASON)))
 
 
 def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
@@ -750,8 +766,10 @@ async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[st
 
 
 @router.post("/api/cron/jobs/{job_id}/pause")
-async def pause_cron_job(job_id: str, profile: Optional[str] = None):
-    return await _run_cron_dashboard_io(_pause_cron_job_sync, job_id, profile)
+async def pause_cron_job(job_id: str, profile: Optional[str] = None,
+                         body: Optional[CronJobPause] = None):
+    reason = (body.reason or "").strip() if body else ""
+    return await _run_cron_dashboard_io(_pause_cron_job_sync, job_id, profile, reason or None)
 
 
 @router.post("/api/cron/jobs/{job_id}/resume")
