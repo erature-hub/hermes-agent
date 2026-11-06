@@ -3,6 +3,7 @@ import pytest
 
 from agent import conversation_loop as cl
 from agent.context_compressor import ContextCompressor
+from agent.turn_nudges import _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB
 
 
 @pytest.mark.parametrize("dropped", [None, ["write_file"]])
@@ -14,5 +15,5 @@ def test_partial_stub_continuation_says_tools_remain_available(dropped):
 
 @pytest.mark.parametrize("dropped", [None, ["write_file"]])
 def test_new_and_legacy_stub_nudges_are_recognized_as_synthetic(dropped):
-    for text in (cl._get_continuation_prompt(True, dropped), cl._LEGACY_LENGTH_CONTINUATION_NETWORK_STUB):
+    for text in (cl._get_continuation_prompt(True, dropped), _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB):
         assert ContextCompressor._is_synthetic_compression_user_turn({"role": "user", "content": text})
