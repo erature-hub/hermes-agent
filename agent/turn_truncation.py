@@ -20,6 +20,7 @@ from agent.message_sanitization import close_interrupted_tool_sequence
 from agent.repetition_guard import is_repetition_dominated
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import content_policy_copy, provider_label_for, site_copy, stamp_failure
+from agent.turn_nudges import _CODEX_INCOMPLETE_NUDGE
 from agent.turn_retry_state import TurnRetryState
 from agent.usage_pricing import normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -585,7 +586,6 @@ def continue_codex_incomplete(
     whole budget), the next attempt goes out with reasoning off and a doubled output
     cap — the same one-shot overrides the chat-completions length path uses — because
     re-sending the identical budget and effort re-burns the budget identically (#90393)."""
-    from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
     from agent.turn_response_check import _codex_finish_reason
 
     agent._codex_incomplete_retries += 1
