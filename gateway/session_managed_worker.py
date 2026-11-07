@@ -21,6 +21,19 @@ from hermes_state_runtime import RuntimeStoreError
 # The interpreter only imports psutil before it introduces itself; a child silent this long
 # is wedged (loader/stdio stall), not slow.
 HELLO_SECONDS = 60
+# The handshake deadline is DERIVED from the spawn cost this host actually pays, not fixed:
+# the child's boot includes the PM dependency probe, whose cost tracks the host's disk and CPU
+# load. A busy host that boots a worker in 90s must not have that worker declared wedged at
+# 60s. The floor keeps a fast host honest (a child silent this long IS wedged) and the
+# ceiling bounds a pathological measurement (#t_853294b3).
+HELLO_DEADLINE_MARGIN = 2.0
+HELLO_DEADLINE_CEILING = 600.0
+# A child that never introduced itself did not fail the CARD: it never started it. The owner's
+# managed-worker child boots the PM dependency probe before it can say hello, and that probe
+# costs whatever the host's disk and CPU cost on the day. A slow boot is the HOST's condition,
+# so it must be booked like one: the claim is released and the card stays retryable, instead of
+# spending the card's failure budget and tripping the breaker at two attempts (#t_853294b3).
+HELLO_TIMEOUT_BOOKING = 'managed_worker_hello_timeout'
 # After Stop the child interrupts its agent and emits its result; the owner terminates a
 # child that has not acknowledged within this window instead of waiting on the pipe forever.
 STOP_ACK_SECONDS = 30
@@ -524,6 +537,39 @@ def _compression_ancestors(db, session_id):
     return ancestors[::-1]
 
 
+def _hello_deadline_seconds(authority) -> float:
+    """The handshake deadline, derived from the spawn cost this host actually pays.
+
+    A managed worker's boot runs the PM dependency probe before it can say hello, and that
+    probe's cost tracks the host's disk and CPU load: on a busy day the same child needs
+    far longer than on an idle one. A FIXED deadline therefore turned a slow host into a
+    fleet of workers declared "wedged" at 60s — a failure the worker never caused and
+    cannot report (#t_853294b3).
+
+    The deadline is the observed cost of this profile's most recent successful handshakes,
+    scaled by a margin, floored at ``HELLO_SECONDS`` (a child silent that long IS wedged)
+    and capped so a pathological measurement cannot hang the attempt forever.
+    """
+    observed = getattr(authority, '_managed_hello_costs', None)
+    if not observed:
+        return float(HELLO_SECONDS)
+    slowest = max(observed)
+    return min(HELLO_DEADLINE_CEILING, max(float(HELLO_SECONDS), slowest * HELLO_DEADLINE_MARGIN))
+
+
+def _record_hello_cost(authority, elapsed: float) -> None:
+    """Remember how long this profile's last handshake took, for the next deadline.
+
+    Bounded: only the recent costs matter, and an old measurement from a different host
+    state must not raise today's deadline.
+    """
+    costs = getattr(authority, '_managed_hello_costs', None)
+    if costs is None:
+        costs = authority._managed_hello_costs = []
+    costs.append(elapsed)
+    del costs[:-8]
+
+
 def _mark_spawning(authority, ref, row):
     """Mark the generation pre-worker: until the worker registers, a gateway stop has nothing to
     signal, so it latches for this generation instead (#134889 GW-22). Set before ``@`` expansion,
@@ -554,12 +600,20 @@ def _record_lost_attempt(authority, policy, exc, reason, scope):
     A worker that dies in ``worker.adopt`` never writes ``worker_bound``/``worker_result``, so
     without it the card's run learns nothing from its own loss. A deliberate Stop or a
     superseded generation is not a loss. Tracked, so retirement joins the write.
+
+    A handshake timeout is the HOST's condition, not the card's: the child never introduced
+    itself, so it never began the card's work. It is booked as infrastructure so the claim is
+    released and the card stays retryable rather than spending its failure budget (#t_853294b3).
     """
     if (not getattr(policy, 'kanban_json', None) or isinstance(exc, asyncio.CancelledError)
             or reason in ('managed_worker_stopped', 'stale_generation')):
         return None
-    from gateway.session_kanban import record_worker_loss
+    from gateway.session_kanban import record_worker_lost_infrastructure, record_worker_loss
     from gateway.session_runtime_workers import track_mutation
+    if reason == HELLO_TIMEOUT_BOOKING:
+        return track_mutation(authority, asyncio.to_thread(partial(
+            record_worker_lost_infrastructure, policy, reason,
+            pid=(scope or {}).get('pid'), elapsed_s=HELLO_SECONDS)))
     return track_mutation(authority, asyncio.to_thread(partial(record_worker_loss, policy, reason,
                                                                pid=(scope or {}).get('pid'), bound=scope is not None)))
 
@@ -648,6 +702,9 @@ async def execute_managed(authority, ref, row, policy):
         return ''
     worker, process = spawned
     workers = authority._managed_workers
+    # The clock for the handshake: the child's boot (PM dependency probe included) starts
+    # when the process is spawned, and the measured cost sizes the next wait (#t_853294b3).
+    _hello_started_at = time.monotonic()
     # A Stop acknowledged during the env/spawn awaits found no worker and was latched for this
     # generation; consume it in the same step that makes the worker reachable to interrupt_managed.
     authority.adopt_agent(ref.session_id, row['generation'], worker)
@@ -656,7 +713,13 @@ async def execute_managed(authority, ref, row, policy):
     try:
         # The interpreter behind the handle introduces itself first; the owner verifies that
         # identity (alive, same birth, descends from the handle) before reserving for it.
-        hello = await worker.next_frame(HELLO_SECONDS, ack=0)
+        # The deadline is derived from the spawn cost this host actually pays (see
+        # ``_hello_deadline_seconds``), so a busy host that boots workers slowly does not
+        # declare them wedged (#t_853294b3).
+        hello = await worker.next_frame(_hello_deadline_seconds(authority), ack=0)
+        # The handshake this profile just paid is the next one's deadline basis: the child's
+        # boot cost (PM probe included) is what the wait has to cover (#t_853294b3).
+        _record_hello_cost(authority, time.monotonic() - _hello_started_at)
         if worker.stop.is_set():
             # Stopped before the child could receive controls: hello raced the latch; never bootstrap.
             raise RuntimeStoreError('managed_worker_stopped')

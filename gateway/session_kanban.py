@@ -155,6 +155,7 @@ async def run_task(connection, params):
 def bind_worker_context(frame):
     """Only the adopted private exec calls this, before tool discovery imports."""
     import os
+    import time
     context = json.loads(frame['policy'].get('kanban_json') or 'null')
     if context is None:
         return
@@ -188,8 +189,15 @@ def bind_worker_context(frame):
             # interpreter is recorded beside it so a sweep can tell when the attempt is truly gone.
             from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT, _process_fingerprint
             fingerprint = _process_fingerprint(os.getpid()) or UNVERIFIED_WORKER_FINGERPRINT
+            # The admission->bind gap is the spawn cost this attempt actually paid. Record it
+            # so a slow boot is visible BEFORE it becomes a timeout, instead of only being
+            # inferable from two event timestamps after the fact (#t_853294b3).
+            admitted = conn.execute(
+                "SELECT created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' "
+                "ORDER BY id DESC LIMIT 1", (task.id, context['run_id'])).fetchone()
+            gap = int(time.time()) - int(admitted['created_at']) if admitted and admitted['created_at'] else None
             kb._append_event(conn, task.id, 'worker_bound', {'pid': os.getpid(), 'claim_lock': context['claim_lock'],
-                             'started_at': fingerprint}, run_id=context['run_id'])
+                             'started_at': fingerprint, 'admitted_to_bind_s': gap}, run_id=context['run_id'])
             claimed = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",
                                    (task.id, context['run_id'])).fetchone()
     # Heartbeats extend the claim by the TTL the dispatcher claimed it with (a spawned worker
@@ -317,6 +325,10 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
 
     Dropped when the card has moved past the run (it says nothing about the current attempt).
     Never raises: the caller's own loss handling must not depend on the board write.
+
+    ``reason`` names the deadline the attempt missed, so the board can say WHICH wait ran
+    out instead of a bare exit code: a worker that never introduced itself died on the
+    handshake, not on the card's work (#t_853294b3).
     """
     try:
         context = json.loads(policy.kanban_json or 'null')
@@ -337,6 +349,36 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
     except Exception:
         import logging
         logging.getLogger(__name__).exception('kanban worker_lost record failed')
+
+
+def record_worker_lost_infrastructure(policy, reason, *, pid=None, elapsed_s=None):
+    """Record a loss the HOST caused: the attempt never started the card's work.
+
+    A managed worker that never introduced itself (its boot ran past the handshake
+    deadline) did not fail the card; it never began it. The board books that as
+    infrastructure, so the claim is released and the card stays retryable instead of
+    spending its failure budget and tripping the breaker (#t_853294b3).
+    """
+    try:
+        context = json.loads(policy.kanban_json or 'null')
+        if not context:
+            return
+        from hermes_cli.kanban_db_connect import connect_closing
+        from hermes_cli import kanban_db as kb
+        run_id = int(context['run_id'])
+        with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
+            row = conn.execute('SELECT status, current_run_id FROM tasks WHERE id=?',
+                               (context['task_id'],)).fetchone()
+            if row is None or row[0] != 'running' or row[1] != run_id:
+                return
+            kb._append_event(conn, context['task_id'], 'worker_lost',
+                             {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
+                              'run_id': run_id, 'pid': pid, 'bound': False,
+                              'infrastructure': True, 'elapsed_s': elapsed_s},
+                             run_id=run_id)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception('kanban worker_lost infrastructure record failed')
 
 
 def _bound_worker_matches(conn, context):

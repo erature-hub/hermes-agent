@@ -92,7 +92,7 @@ async def run(params, board_db):
                     f' (HTTP {status})' if status else '')
                 raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
         else:
-            return _exit_code(receipt, params, board_db)
+            return _exit_code(receipt, params, board_db, waited_s=claim.silent_for())
         failures = 1 if claim.answered != seen else failures + 1
         # Jittered (1-2 s first, up to 16 s): workers of one dead owner do not all redial, and so
         # start a replacement, in the same instant.
@@ -140,10 +140,13 @@ async def _await_receipt(client, params, board_db, claim):
     return receipt
 
 
-def _exit_code(receipt, params, board_db):
+def _exit_code(receipt, params, board_db, waited_s=None):
     from hermes_cli.gateway_client import GatewayClientError
     if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
+        # Name the wait this attempt actually paid. The board quotes the worker's last
+        # output verbatim, so "which deadline it missed" has to be in these words (#t_853294b3).
+        detail = f' after {waited_s:.0f}s' if waited_s else ''
+        raise GatewayClientError(f'Kanban execution unknown; retained by owner{detail}')
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
