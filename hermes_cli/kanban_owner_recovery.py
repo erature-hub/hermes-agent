@@ -1,10 +1,44 @@
 """Read-only canonical admission fences for dispatcher reclaim paths."""
 from contextlib import closing
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import sqlite3
 import time
+from typing import Optional
 import psutil
+
+# The owner's handshake deadline for a managed worker to introduce itself. Named here so the
+# board can say WHICH deadline a worker missed, instead of only that it died (#t_853294b3).
+HELLO_DEADLINE_SECONDS = 60
+
+
+@dataclass
+class DeadWorker:
+    """How ``detect_crashed_workers`` should book one dead worker.
+
+    Lives here, beside the fence evidence that decides its booking: this module is what
+    reads the owner's note and the board's own admission records to decide whether a death
+    was the CARD's fault (the work ran and failed) or the HOST's (the worker never started,
+    so the card's work never began). The dispatcher books what this decides.
+    """
+
+    kind: str
+    code: Optional[int]
+    error_text: str
+    event_kind: str
+    event_payload: dict
+    protocol_violation: bool = False
+    rate_limited: bool = False
+    terminal_provider: bool = False
+    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
+    credential/model — trips the breaker on this first occurrence."""
+
+    @property
+    def run_outcome(self) -> str:
+        # A rate-limited requeue is recorded as ``rate_limited`` so board history
+        # doesn't show a phantom crash for a quota wall.
+        return "rate_limited" if self.rate_limited else "crashed"
 
 
 def _owner_receipt(conn, task_id):
@@ -212,6 +246,57 @@ def reclaim_error(conn, task_id, claim_lock) -> str:
     return f"stale_lock={claim_lock}" + (f" [{note}]" if note else "")
 
 
+def attempt_never_bound(conn, task_id):
+    """``(never_bound, admitted_at)`` for the task's CURRENT run.
+
+    ``never_bound`` is True when the owner ADMITTED the attempt but no interpreter ever
+    bound it: the worker never introduced itself, so the card's work never started. The
+    owner's own ``worker_lost`` note is written off the owner loop and can lose the race
+    with the crash sweep, so the board's own evidence is what makes this reliable
+    (#t_853294b3).
+    """
+    admitted = conn.execute(
+        "SELECT e.created_at FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id "
+        "WHERE t.id=? AND e.task_id=t.id AND e.kind='owner_admitted' ORDER BY e.id DESC LIMIT 1",
+        (task_id,)).fetchone()
+    if admitted is None:
+        return False, None
+    if _latest_run_event(conn, task_id, 'worker_bound'):
+        return False, admitted['created_at']
+    return True, admitted['created_at']
+
+
+def mark_never_bound_attempt(conn, task_id, dead) -> bool:
+    """Mark a dead attempt the owner admitted but that never bound an interpreter.
+
+    The card's work never began, so the death is the HOST's condition, not the card's: the
+    attempt is booked as infrastructure (claim released, card stays retryable, the breaker
+    never trips) instead of spending the card's failure budget. The error text names the
+    deadline that ran out and how long the boot actually took (#t_853294b3).
+
+    The OWNER's own note outranks this board-side evidence: it says whether the worker had
+    bound, and a note that names a real failure keeps charging the breaker. Only an attempt
+    with NO note at all is judged here — which is exactly the outage's shape, because the
+    owner never got far enough to write one.
+    """
+    if dead.event_payload.get("infrastructure"):
+        return True
+    if _latest_run_event(conn, task_id, 'worker_lost'):
+        return False  # the owner recorded how it ended; its word is the authority
+    never_bound, admitted_at = attempt_never_bound(conn, task_id)
+    if not never_bound:
+        return False
+    dead.event_payload['infrastructure'] = True
+    elapsed = int(time.time() - admitted_at) if admitted_at else None
+    if elapsed is not None:
+        dead.event_payload['admitted_to_exit_s'] = elapsed
+    dead.error_text += (
+        f" [the worker never introduced itself within the {HELLO_DEADLINE_SECONDS:g}s handshake "
+        f"deadline ({elapsed}s after admission) — its boot never finished, so the attempt never "
+        f"began the card's work]")
+    return True
+
+
 def apply_attempt_note(conn, task_id, pid, dead) -> None:
     """Fold the owner's own record of how the attempt ended into ONE dead worker's booking.
 
@@ -219,14 +304,17 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     lost reads as a protocol violation. The owner's ``worker_lost`` evidence outranks it: the
     turn never finished, so it books as a crash and charges the breaker, and the
     protocol-violation streak (which reads the persisted payload) does not count it.
+
+    An infrastructure loss (the host never got the worker started) books as infrastructure
+    instead: the claim is released and the card stays retryable, because nothing about the
+    CARD ran (#t_853294b3).
     """
     lost = _latest_run_event(conn, task_id, "worker_lost")
     note = owner_attempt_note(conn, task_id, lost)
-    if not note:
-        return
-    dead.event_payload["attempt_note"] = note
     if lost:
         dead.event_payload["worker_lost"] = lost
+        if lost.get("infrastructure"):
+            dead.event_payload["infrastructure"] = True
         if dead.protocol_violation:
             from hermes_cli.kanban_db_dispatch import _PROTOCOL_VIOLATION_ERROR
             dead.protocol_violation = False
@@ -236,6 +324,13 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
             # Keep the worker's last output that _classify_dead_worker appended.
             dead.error_text = (f"pid {pid} exited cleanly after its managed worker was lost."
                                + dead.error_text.removeprefix(_PROTOCOL_VIOLATION_ERROR))
+    else:
+        # No note at all: the owner never got far enough to write one. That is the outage's
+        # shape — the attempt was admitted and no interpreter ever introduced itself.
+        mark_never_bound_attempt(conn, task_id, dead)
+    if not note:
+        return
+    dead.event_payload["attempt_note"] = note
     # Before the worker's own output: the stored error is capped, and the output may be long.
     from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
     head, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)

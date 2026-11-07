@@ -1035,28 +1035,6 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     return " ".join(lines)[-400:]
 
 
-@dataclass
-class _DeadWorker:
-    """How ``detect_crashed_workers`` should book one dead worker."""
-
-    kind: str
-    code: Optional[int]
-    error_text: str
-    event_kind: str
-    event_payload: dict
-    protocol_violation: bool = False
-    rate_limited: bool = False
-    terminal_provider: bool = False
-    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
-    credential/model — trips the breaker on this first occurrence."""
-
-    @property
-    def run_outcome(self) -> str:
-        # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
-
-
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -1171,7 +1149,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+        from hermes_cli.kanban_owner_recovery import (
+            apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked)
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1313,6 +1292,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
+                # The host never got the worker started: the card's work never began, so
+                # the claim is released and the card stays retryable (#t_853294b3).
+                infrastructure=bool(dead.event_payload.get("infrastructure")),
             )
         if tripped:
             auto_blocked.append(tid)
@@ -2962,3 +2944,6 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
+# The dead worker's booking record lives beside the fence evidence that decides it
+# (late-bound: that module reaches back into this one inside functions).
+from hermes_cli.kanban_owner_recovery import DeadWorker as _DeadWorker
