@@ -84,6 +84,11 @@ export const enErrorCodes: ThreadCopy['errorCodes'] = {
     body: provider =>
       `${provider} did not accept how this request was built. Switch provider or send diagnostics so we can look into it.`
   },
+  model_not_loaded: {
+    title: 'The model is not loaded',
+    body: () =>
+      `Your local server has the model on disk but is not running it. Load it, then send your message again — your conversation is fine and nothing was lost.`
+  },
   truncated: {
     title: 'The reply was cut short',
     body: 'The model stopped before finishing. Retry to get a complete reply.'

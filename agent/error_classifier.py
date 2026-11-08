@@ -48,6 +48,11 @@ class FailoverReason(enum.Enum):
     image_too_large = "image_too_large"   # Native image part exceeds provider's per-image limit — shrink and retry
     image_corrupt = "image_corrupt"       # Provider can't decode image bytes — strip and retry (shrinking won't help)
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
+    # The server has the model on disk but has not loaded it (llama.cpp / LM Studio
+    # / Unsloth Studio "Switch model by request" off). The request shape is fine —
+    # the SERVER's state is wrong — so this is neither a format error nor a missing
+    # model. Retrying after the host loads it succeeds, so it must be retryable.
+    model_not_loaded = "model_not_loaded"  # 400/404 "no model loaded" — load it, then retry
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator account data/privacy policy excluded the only endpoint
     data_policy_denied = "data_policy_denied"  # Context holds a connector result needing a no-training model; none serves it
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
@@ -287,6 +292,30 @@ _MODEL_NOT_FOUND_PATTERNS = (
     "is no longer free",
 )
 
+# A local inference server that has the model on disk but has NOT loaded it.
+# llama.cpp / LM Studio / Unsloth Studio all answer with a 400 (or a 404 when the
+# slug IS known) and a body that names the fix:
+#
+#   "No model loaded. Call POST /inference/load first. Or enable Model
+#    auto-switch (Settings > API) to load a requested model automatically."
+#   "The model '<id>' is downloaded but not loaded, and 'Switch model by request'
+#    is off, so this server can only serve the loaded model."
+#
+# This is SERVER STATE, not a bad request and not a missing model: the very same
+# request succeeds once the model is loaded. Classifying it as format_error
+# aborts the turn non-retryably and tells the user their CONVERSATION is
+# malformed — which is how a local-model profile ends up bricked on a
+# conversation that was never the problem.
+_MODEL_NOT_LOADED_PATTERNS = (
+    "no model loaded",
+    "call post /inference/load",
+    "model auto-switch",
+    "is downloaded but not loaded",
+    "is not loaded, and",
+    "switch model by request",
+    "can only serve the loaded model",
+)
+
 # Qwen/vLLM chat-template "No user query found". Shared by the invalid-body
 # table (→ format_error) and the llama.cpp grammar guard so they cannot drift.
 _NO_USER_QUERY_SIGNAL = "no user query found"
@@ -483,6 +512,11 @@ _V_RATE_LIMIT = _v(_R.rate_limit, **_ROTATE_FALLBACK)
 _V_AUTH_ROTATE = _v(_R.auth, retryable=False, **_ROTATE_FALLBACK)
 _V_AUTH_FALLBACK = _v(_R.auth, **_ABORT_FALLBACK)
 _V_MODEL_NOT_FOUND = _v(_R.model_not_found, **_ABORT_FALLBACK)
+# The model is present but not loaded: the HOST can fix this by loading it, and the
+# same request then succeeds. So it is RETRYABLE (the retry loop keeps trying with
+# backoff) and must not fall back to another provider — a different provider would
+# not have the local model either, and the user's conversation is not at fault.
+_V_MODEL_NOT_LOADED = _v(_R.model_not_loaded, retryable=True, should_fallback=False)
 _V_UPSTREAM_BLOCKED = _v(_R.upstream_blocked, **_ABORT_FALLBACK)
 _V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, **_ABORT_FALLBACK)
 # Another account in the same pool may hold the entitlement; the credential itself is healthy.
@@ -1093,6 +1127,12 @@ def _status_404(c: _Ctx) -> Verdict:
     # so _by_error_code never sees it; a bare "Not Found" message has nothing to match.
     if c.code in _BILLING_ERROR_CODES:
         return _V_BILLING
+    # A server that knows the slug but has not loaded it answers 404 "is downloaded
+    # but not loaded, and 'Switch model by request' is off". The model EXISTS, so
+    # this is not model_not_found — falling back to another provider would not
+    # have it either. Load it and retry.
+    if any(p in c.msg for p in _MODEL_NOT_LOADED_PATTERNS):
+        return _V_MODEL_NOT_LOADED
     verdict = _first_match(c.msg, _404_RULES)
     if verdict is not None:
         return verdict
@@ -1220,6 +1260,12 @@ def _oversized_message_content_rejection(body: Any) -> bool:
 def _classify_400(c: _Ctx) -> Verdict:
     """400 Bad Request — image/tool shapes, request-shape rejections, overflow, or generic."""
     msg, code = c.msg, c.code
+    # A local server that has the model on disk but has not loaded it rejects the
+    # request with a 400 whose body names the fix. The request shape is FINE, so
+    # this must be caught BEFORE the generic validation/format paths — otherwise
+    # it aborts non-retryably as a malformed conversation.
+    if any(p in msg for p in _MODEL_NOT_LOADED_PATTERNS):
+        return _V_MODEL_NOT_LOADED
     # A size cap reported *through* a message content field must beat the keyword
     # multimodal rule, which would otherwise claim "input should be a valid string".
     if _oversized_message_content_rejection(c.body):
