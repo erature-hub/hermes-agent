@@ -44,6 +44,12 @@ export const ERROR_CODE_KEYS = [
   'provider_policy_blocked',
   'content_policy_blocked',
   'format_error',
+  // A local inference server has the model on disk but has not loaded it
+  // ("No model loaded. Call POST /inference/load first."). The conversation
+  // is fine and the request shape is fine - the SERVER needs the model
+  // loaded. Telling the user to switch provider or start a new chat is
+  // false and loses their session; retrying is what actually helps.
+  'model_not_loaded',
   'truncated',
   'invalid_response',
   'empty_response',
