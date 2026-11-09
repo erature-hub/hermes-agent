@@ -174,6 +174,80 @@ def launch_supervisor(identity: dict[str, Any]) -> Optional[str]:
     return None
 
 
+# How many instances of the control pipe this owner serves.
+#
+# The pipe is named for the HOME, and a multiplexer answers for EVERY profile it serves through
+# that one pipe, so the count has to cover the served set rather than one profile's traffic: a
+# fixed eight made a busy multiplexer queue its own profiles' workers behind each other, and the
+# worker that queued long enough lost its mint budget and died before it did any work
+# (#t_45f5d3c4).
+PIPE_INSTANCES = 8
+# Instances per served profile. Each profile's worker boot, its interactive client and its
+# hosted-room participants can all be minting at once, so one instance per profile would still
+# queue a busy one behind itself.
+PIPE_INSTANCES_PER_PROFILE = 2
+# Ceiling on the instance count: each instance is a thread with its own pipe, and a pathological
+# profile count must not spawn an unbounded number of them.
+PIPE_INSTANCES_CEILING = 64
+
+
+def pipe_instance_budget(served_profiles: int = 0) -> int:
+    """Pipe instances for a control socket serving *served_profiles* profiles.
+
+    At least the historical eight (a standalone owner keeps what it always had), one instance
+    per served profile beyond the first, and never more than the ceiling.
+    """
+    if served_profiles <= 1:
+        return PIPE_INSTANCES
+    return min(PIPE_INSTANCES_CEILING,
+               PIPE_INSTANCES + (served_profiles - 1) * PIPE_INSTANCES_PER_PROFILE)
+
+
+# The control socket answers a LOCAL client. A client that arrives while the owner's event loop
+# is stalled under GIL pressure waits for a pipe instance, and the wait is what the client's
+# budget must cover: this host's gateway stalls its own loop for tens of seconds under load
+# (agent.log: p50 14.5s, p90 110s), so a fixed few-second budget ends a worker that only had
+# to wait for the owner to breathe. The owner therefore publishes how long ITS exchanges have
+# actually taken, and a client scales its budget from that (#t_45f5d3c4).
+#
+# The floor keeps a fast host honest (a client whose owner answers in milliseconds should not
+# wait minutes) and the ceiling bounds a pathological measurement so a mint can never hang a
+# boot forever.
+CONTROL_BUDGET_FLOOR_S = 5.0
+CONTROL_BUDGET_CEILING_S = 120.0
+# Multiplier on the owner's observed worst exchange: the next exchange is not expected to be
+# worse than what this owner just paid, and the margin covers the next one being slower.
+CONTROL_BUDGET_MARGIN = 2.0
+# How many recent exchanges the observation is drawn from.
+CONTROL_BUDGET_SAMPLES = 8
+
+
+class ControlBudget:
+    """The owner's own record of how long its control exchanges take.
+
+    Each exchange is timed as it is served, so the number reflects the owner's real behaviour
+    under its real load — the only source a fresh client process can learn it from.
+    """
+
+    def __init__(self) -> None:
+        self._costs: list[float] = []
+
+    def record(self, elapsed: float) -> None:
+        self._costs.append(elapsed)
+        del self._costs[:-CONTROL_BUDGET_SAMPLES]
+
+    def budget_seconds(self) -> float:
+        """Seconds a client should allow one control exchange here, from what this owner pays."""
+        if not self._costs:
+            return CONTROL_BUDGET_FLOOR_S
+        return min(CONTROL_BUDGET_CEILING_S,
+                   max(CONTROL_BUDGET_FLOOR_S, max(self._costs) * CONTROL_BUDGET_MARGIN))
+
+
+# The owner's live budget, published on its ``identify`` answer.
+_CONTROL_BUDGET = ControlBudget()
+
+
 def build_identify_payload() -> dict[str, Any]:
     """Default ``identify`` answer, built from gateway.status primitives."""
     from gateway.status import _build_pid_record, _get_code_identity_fields, _profile_label_for_home, read_runtime_status
@@ -189,6 +263,7 @@ def build_identify_payload() -> dict[str, Any]:
         served = (read_runtime_status() or {}).get("served_profiles")
         if isinstance(served, list) and served:
             payload["served_profiles"] = served
+    payload["control_budget_s"] = _CONTROL_BUDGET.budget_seconds()
     return payload
 
 
@@ -289,9 +364,38 @@ class GatewayControlServer:
 
     async def _start_windows(self) -> bool:
         from gateway.runtime_bootstrap_windows import NativeControlServer
-        self._pipe_server = NativeControlServer(self._home, self.handle_request_line)
+        self._pipe_server = NativeControlServer(self._home, self.handle_request_line,
+                                                instances=self._pipe_instance_budget())
         await asyncio.to_thread(self._pipe_server.start)
         return True
+
+    def _pipe_instance_budget(self) -> int:
+        """How many pipe instances this owner's control socket serves.
+
+        The pipe is named for the HOME, and a multiplexer answers for EVERY profile it serves
+        through that one pipe, so the instance count has to cover the served set rather than one
+        profile's traffic: a fixed eight made a busy multiplexer queue its own profiles' workers
+        behind each other, and the worker that queued long enough lost its mint budget and died
+        before it did any work (#t_45f5d3c4).
+        """
+        from gateway.control_socket import pipe_instance_budget
+        store = self.ticket_store
+        served = len(getattr(store, "profile_ids", ()) or ()) if store is not None else 0
+        return pipe_instance_budget(served)
+
+    def refresh_pipe_instances(self) -> None:
+        """Grow the pipe to cover the served set as it stands now.
+
+        A profile hot-served after boot joins the served set, so the pipe must gain the
+        instances that profile's traffic needs — otherwise the newly served profile's workers
+        queue behind the ones already serving (#t_45f5d3c4).
+        """
+        pipe = self._pipe_server
+        if pipe is None:
+            return
+        with contextlib.suppress(Exception):
+            pipe.grow_to(self._pipe_instance_budget())
+
     async def stop(self) -> None:
         """Stop serving and remove the socket/pointer files."""
         if self.ticket_store is not None:
@@ -322,6 +426,17 @@ class GatewayControlServer:
 
     def handle_request_line(self, raw: bytes, peer_subject: Optional[str] = None) -> bytes:
         """One JSON request line -> one JSON response line. Never raises (shared by POSIX + pipe)."""
+        started = time.monotonic()
+        try:
+            encoded = self._handle_request_line(raw, peer_subject)
+        finally:
+            # How long THIS owner actually took to answer: the number a client scales its own
+            # budget from, so a client that arrives during a stall waits it out instead of
+            # declaring the owner unreachable (#t_45f5d3c4).
+            _CONTROL_BUDGET.record(time.monotonic() - started)
+        return encoded
+
+    def _handle_request_line(self, raw: bytes, peer_subject: Optional[str] = None) -> bytes:
         request_id: Any = None
         try:
             request = json.loads(raw.decode("utf-8"))

@@ -303,20 +303,55 @@ def query_runtime_control(home: Path, request: bytes, timeout: float) -> bytes:
 # Listening pipe instances, one worker each. Requests are served concurrently, as the POSIX
 # socket does through its executor: a handler may dial this same pipe (a hosted room whose
 # source and member share one multiplexer re-enters it via hosted-producer -> hosted-attest).
+#
+# The count comes from ``gateway.control_socket.pipe_instance_budget``: the pipe is named for
+# the HOME, and a multiplexer answers for EVERY profile it serves through that one pipe, so the
+# count has to cover the served set rather than one profile's traffic (#t_45f5d3c4).
 _PIPE_INSTANCES = 8
 
 
 class NativeControlServer:
     """Bounded native workers, independent of asyncio event-loop policy."""
-    def __init__(self, home, handler):
+    def __init__(self, home, handler, instances: int | None = None):
+        from gateway.control_socket import PIPE_INSTANCES_CEILING
         self.home, self.handler = home, handler
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._error = None
+        self._instances = instances or _PIPE_INSTANCES
+        # The NAME's instance ceiling is fixed by the first instance (it claims the name with
+        # FILE_FLAG_FIRST_PIPE_INSTANCE), so it is set high enough to allow the count to grow
+        # later: a profile hot-served after boot joins the served set, and the pipe must be able
+        # to answer for it without a restart.
+        self._max_instances = PIPE_INSTANCES_CEILING
+        self._lock = threading.Lock()
         self._threads = [threading.Thread(target=self._run, args=(index == 0,), daemon=True,
                                           name=f'runtime-control-pipe-{index}')
-                         for index in range(_PIPE_INSTANCES)]
+                         for index in range(self._instances)]
         self._thread = self._threads[0]
+
+    def grow_to(self, instances: int) -> int:
+        """Add pipe instances so a grown served set is still answered concurrently.
+
+        Returns the instance count now in service. A grown profile gets its own instances
+        rather than queueing behind the ones already serving (#t_45f5d3c4).
+        """
+        from gateway.control_socket import PIPE_INSTANCES_CEILING
+        target = max(self._instances, min(int(instances), PIPE_INSTANCES_CEILING))
+        added = []
+        with self._lock:
+            if self._stop.is_set():
+                return self._instances  # the server is closing; a new instance would serve nothing
+            while len(self._threads) < target:
+                index = len(self._threads)
+                thread = threading.Thread(target=self._run, args=(False,), daemon=True,
+                                          name=f'runtime-control-pipe-{index}')
+                self._threads.append(thread)
+                added.append(thread)
+            self._instances = target
+        for thread in added:
+            thread.start()
+        return self._instances
 
     def start(self):
         # The first instance claims the name (FILE_FLAG_FIRST_PIPE_INSTANCE) before any other.
@@ -331,10 +366,12 @@ class NativeControlServer:
 
     def close(self):
         self._stop.set()
-        for thread in self._threads:
+        with self._lock:
+            threads = list(self._threads)
+        for thread in threads:
             if thread.ident is not None:
                 thread.join(timeout=5)
-        if any(thread.is_alive() for thread in self._threads):
+        if any(thread.is_alive() for thread in threads):
             raise TimeoutError('runtime control pipe did not stop')
 
     def _create_pipe(self, first=True):
@@ -351,9 +388,12 @@ class NativeControlServer:
             raise PermissionError('cannot create private pipe DACL')
         attrs = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
         try:
+            # nMaxInstances bounds the instances the PIPE NAME may hold at once, and the first
+            # instance (FILE_FLAG_FIRST_PIPE_INSTANCE) sets it for the name — so it is the
+            # ceiling the count may grow to, not the count now in service.
             return win.CreateNamedPipe(windows_pipe_name(self.home),
                                        3 | win.FILE_FLAG_OVERLAPPED | (0x00080000 if first else 0),
-                                       8, _PIPE_INSTANCES, 65536, 65536, 2000, ctypes.addressof(attrs))
+                                       8, self._max_instances, 65536, 65536, 2000, ctypes.addressof(attrs))
         finally:
             k = ctypes.WinDLL('kernel32', use_last_error=True)
             _api(k, 'LocalFree', ctypes.c_void_p, [ctypes.c_void_p])(descriptor)
