@@ -232,6 +232,12 @@ def _publish_served_set(runner):
     registry = runner.session_authorities
     runner.session_runtime_descriptor['served_profiles'] = registry.served_profiles()
     runner.session_ticket_store.profile_ids = registry.profile_ids()
+    # The control pipe is one listener for every served profile, so a grown served set needs
+    # more instances on it: the newly served profile's workers must not queue behind the ones
+    # already serving (#t_45f5d3c4).
+    server = getattr(runner, 'session_control_server', None)
+    if server is not None:
+        server.refresh_pipe_instances()
 
 
 def reserve_profile_home(runner, name, home, cancel=None):

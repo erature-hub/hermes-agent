@@ -36,6 +36,10 @@ class GatewayEndpoint:
     # A gateway that outlived ``hermes update`` keeps serving old code, so an attaching client
     # compares this with its own checkout and restarts the owner instead of re-attaching it.
     code_sha: str | None = None
+    # Seconds this owner says one control exchange may take (its own observed worst, scaled).
+    # A client that dials it budgets its mint from this instead of a fixed few seconds, so a
+    # worker booting during the owner's stall waits it out instead of dying (#t_45f5d3c4).
+    control_budget_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +153,8 @@ def _endpoint(payload: dict, home: Path, control_home: Path | None = None) -> Ga
         supervisor=supervisor, capabilities=frozenset(capabilities),
         control_home=str(control_home) if control_home is not None else None,
         code_sha=code_sha if isinstance(code_sha := payload.get("code_sha"), str) and code_sha else None,
+        control_budget_s=(control_budget_s if isinstance(control_budget_s := payload.get("control_budget_s"), (int, float))
+                         and not isinstance(control_budget_s, bool) and control_budget_s > 0 else None),
     ), reason_code=RESTART_WAIT_REASON if restart_wait else None)
 
 
@@ -234,6 +240,8 @@ def _served_by_multiplexer(home: Path, *, timeout: float) -> GatewayDiscovery | 
     result = _endpoint(payload, home, control_home=root)
     if result.state == "inaccessible" and result.reason_code == "profile_mismatch":
         return _parked_by_multiplexer(payload, home)  # else: the multiplexer does not serve this profile
+    # The multiplexer published its own exchange budget; the profile it serves inherits it.
+    _publish_owner_control_budget(payload)
     return result
 
 
@@ -298,7 +306,7 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
         raise ValueError("timeout must be finite and positive")
     home = _overlay_owner_home(Path(_canonical_home(profile_home)))
     try:
-        return _endpoint(query_identify(home, timeout=timeout), home)
+        payload = query_identify(home, timeout=timeout)
     except (FileNotFoundError, ConnectionRefusedError):
         served = _served_by_multiplexer(home, timeout=timeout)
         if served is not None:
@@ -320,6 +328,20 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
     except (OSError, ValueError, TypeError):
         # Raw peer data, paths and URLs may contain secrets; report bounded codes.
         return GatewayDiscovery("inaccessible", reason_code="invalid_control_peer")
+    # The owner published how long its own control exchanges take; every later exchange on it
+    # is budgeted from that, so a client that found the owner busy does not give up on it
+    # after a fixed few seconds (#t_45f5d3c4).
+    _publish_owner_control_budget(payload)
+    return _endpoint(payload, home)
+
+
+def _publish_owner_control_budget(payload: dict) -> None:
+    """Record the budget the owner's ``identify`` answer published, for later exchanges."""
+    try:
+        from hermes_cli.gateway_client import publish_control_budget
+        publish_control_budget(payload.get("control_budget_s"))
+    except Exception:
+        pass  # a client without the budget publisher still works; it just uses the floor
 
 
 def _update_fenced(homes) -> bool:

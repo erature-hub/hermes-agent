@@ -223,10 +223,129 @@ class GatewayClient:
             self.pending.pop(rid, None)
 
 
-def private_control_query(home: Path, request: bytes, timeout: float = 5) -> bytes:
+# A control-socket exchange is a LOCAL round trip to a process on this machine, so a slow
+# answer means the owner was busy, not that it refused. The pipe serves several instances
+# concurrently and a client that misses its budget is retried against the next one, so the
+# budget has to cover the wait for a free instance rather than a single unlucky attempt.
+#
+# The window comes from the OWNER, which publishes how long its own exchanges have taken
+# (``control_budget_s`` on its ``identify`` answer): this host's gateway stalls its own event
+# loop for tens of seconds under load (measured in agent.log: p50 14.5s, p90 110s), and every
+# worker that boots during such a window used to die before it did any work. The floor keeps a
+# fast host honest and the ceiling bounds a pathological measurement so a mint can never hang
+# a boot forever (#t_45f5d3c4).
+CONTROL_QUERY_FLOOR_S = 5.0
+CONTROL_QUERY_CEILING_S = 120.0
+# How many instances the mint is retried across. Each attempt is a fresh pipe instance, so
+# this is the pipe's own concurrency: past it the owner is not serving mints at all.
+CONTROL_QUERY_ATTEMPTS = 4
+# The whole mint may take this long, retries included. The owner's own budget covers ONE
+# exchange, and the worker's boot envelope (its outer reconnect window) is 180s, so the mint
+# has to fit inside that envelope rather than multiply it by the attempt count.
+CONTROL_QUERY_TOTAL_CEILING_S = 150.0
+
+# The budget the owner we last spoke to published, and the floor/ceiling it is held to.
+_CONTROL_BUDGET_S: float | None = None
+
+# Multiplier on what this client observed: the next exchange is not expected to be worse than
+# the one just measured, and the margin covers the next one being slower.
+CONTROL_QUERY_MARGIN = 2.0
+
+# What this client has actually observed: how long its own exchanges to the owner took,
+# queue wait included. The owner measures only its own handling time, so it cannot see the
+# wait a client spends queued behind a busy pipe — which is the wait that actually blows a
+# budget. The client's own round trip does see it, so the two are combined.
+_CLIENT_OBSERVED_S: list[float] = []
+
+
+def record_control_exchange(elapsed: float) -> None:
+    """Record how long one control exchange actually took this client.
+
+    This is the client's own round trip, so it includes the time spent queued for a free pipe
+    instance — the wait that ends a worker that never began its work (#t_45f5d3c4).
+    """
+    _CLIENT_OBSERVED_S.append(elapsed)
+    del _CLIENT_OBSERVED_S[:-CONTROL_QUERY_ATTEMPTS]
+
+
+def control_query_budget() -> float:
+    """Seconds one control-socket exchange may take here.
+
+    Two sources, because each sees half the cost: the owner publishes how long its own
+    exchanges have taken, and this client has measured how long its own round trips took
+    (queue wait included). The larger of the two is what a client budgets from, bounded by
+    the floor and the ceiling.
+    """
+    observed = max(_CLIENT_OBSERVED_S, default=0.0) * CONTROL_QUERY_MARGIN
+    published = _CONTROL_BUDGET_S or 0.0
+    return min(CONTROL_QUERY_CEILING_S, max(CONTROL_QUERY_FLOOR_S, published, observed))
+
+
+def publish_control_budget(seconds: float | None) -> None:
+    """Record the budget the owner published, for the exchanges that follow.
+
+    A client learns the owner's budget from its ``identify`` answer, which it fetches before it
+    mints; the value is then what every later exchange on this owner is budgeted from.
+    """
+    global _CONTROL_BUDGET_S
+    if seconds is None:
+        return
+    _CONTROL_BUDGET_S = float(seconds)
+
+
+def private_control_query(home: Path, request: bytes, timeout: float | None = None) -> bytes:
     """Send one request line to *home*'s gateway control socket as this OS user; the raw answer.
 
-    The socket authenticates the peer (same user only), which is what lets a private verb answer."""
+    The socket authenticates the peer (same user only), which is what lets a private verb answer.
+
+    ``timeout`` defaults to :func:`control_query_budget` rather than a fixed few seconds: this is
+    a local round trip, so a slow answer means a busy owner, and the exchange is retried against
+    the next pipe instance rather than failing the caller (#t_45f5d3c4).
+    """
+    budget = control_query_budget() if timeout is None else timeout
+    return _control_query_with_retry(home, request, budget)
+
+
+def _control_query_with_retry(home: Path, request: bytes, budget: float) -> bytes:
+    """One control-socket exchange, retried while the owner is merely busy.
+
+    Only a TIMEOUT is retried: it means the owner did not answer in time (every pipe instance
+    was serving another caller, or the owner's event loop was stalled), so the next attempt
+    finds a free instance. An absent or inaccessible pipe is the owner's own verdict — the
+    owner is gone, or a privilege boundary the retry cannot cross — and is raised at once.
+
+    The attempts SHARE one deadline rather than each taking an unbounded window: the budget is
+    what ONE exchange may cost, and a mint that retried over it without limit would outlast the
+    worker's whole boot envelope. Each attempt gets at most one exchange's worth (the first one
+    is the attempt that has to outlast the owner's own stall), and the retries share what the
+    deadline has left.
+    """
+    from agent.retry_utils import jittered_backoff
+    deadline = time.monotonic() + min(budget * CONTROL_QUERY_ATTEMPTS, CONTROL_QUERY_TOTAL_CEILING_S)
+    last: Exception | None = None
+    for attempt in range(CONTROL_QUERY_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        started = time.monotonic()
+        try:
+            answer = _private_control_query_once(home, request, min(budget, remaining))
+        except TimeoutError as exc:
+            last = exc
+            if attempt + 1 >= CONTROL_QUERY_ATTEMPTS:
+                break
+            # Jittered: workers booting together must not all retry in the same instant.
+            time.sleep(min(jittered_backoff(attempt + 1, base_delay=0.25, max_delay=2.0), remaining))
+            continue
+        # What this round trip really cost, queue wait included: the next exchange on this
+        # owner is budgeted from it (#t_45f5d3c4).
+        record_control_exchange(time.monotonic() - started)
+        return answer
+    raise last if last is not None else TimeoutError("control query timed out")
+
+
+def _private_control_query_once(home: Path, request: bytes, timeout: float) -> bytes:
+    """One attempt: a single request line over the control socket."""
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
         return query_runtime_control(home, request, timeout)
@@ -238,7 +357,8 @@ def private_control_query(home: Path, request: bytes, timeout: float = 5) -> byt
         while b"\n" not in data:
             budget = deadline - time.monotonic()
             if budget <= 0:
-                raise GatewayClientError("Gateway bootstrap timed out")
+                # A timeout, so the retry treats it as one (the owner was busy, not refusing).
+                raise TimeoutError("Gateway bootstrap timed out")
             peer.settimeout(budget)
             chunk = peer.recv(4096)
             if not chunk or len(data) + len(chunk) > 65536:
@@ -258,7 +378,10 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
         "profile_id": endpoint.profile_id, "instance_id": endpoint.instance_id, "purpose": purpose,
         **({"scope": scope} if scope else {}), **({"subject": subject} if subject else {}),
     }}).encode() + b"\n"
-    grant = _identify_response(private_control_query(home, request))
+    # The owner published the budget its own exchanges cost; a mint against a busy owner waits
+    # that long and retries across the pipe's instances instead of dying (#t_45f5d3c4).
+    budget = getattr(endpoint, "control_budget_s", None) or control_query_budget()
+    grant = _identify_response(private_control_query(home, request, timeout=budget))
     if any(grant.get(k) != v for k, v in {
         "profile_id": endpoint.profile_id, "instance_id": endpoint.instance_id, "runtime_protocol": 1,
     }.items()) or not isinstance(grant.get("ticket"), str) or not grant["ticket"]:
