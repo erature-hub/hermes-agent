@@ -963,7 +963,15 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
     if type(sequence) is not int or sequence < 1 or not isinstance(operation, str) or operation not in handlers:
         raise RuntimeStoreError('invalid_params')
     encoded = _json(payload)
-    if len(encoded.encode('utf-8', errors='surrogatepass')) > 4 * 1024 * 1024:
+    # The per-write receipt ceiling. A worker's outbox carries at most one pending entry, so this
+    # bounds a single payload, not the accumulated file. 4MiB was below the real cost of the writes
+    # that flow through it: a compaction commit ships the message list twice (``messages`` plus the
+    # ``held_for_cas`` projection the owner's CAS fence reads), and the busiest sessions in this
+    # host's state.db need more than 4MiB for that one call. 16MiB keeps headroom over that worst
+    # case. The refusal is a PRE-COMMIT one -- no receipt is written and ``last_sequence`` is
+    # unchanged -- so the worker rolls its pending entry back instead of latching the store
+    # (#t_8c013181).
+    if len(encoded.encode('utf-8', errors='surrogatepass')) > 16 * 1024 * 1024:
         raise RuntimeStoreError('invalid_params')
     digest = admission_fingerprint(canonical_target=session_id,
                                   payload={'operation': operation, 'payload': json.loads(encoded)})

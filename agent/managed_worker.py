@@ -408,13 +408,28 @@ def execute(frame, channel):
             # after execution.finish is a stale_generation write that fails the close-time flush.
             from agent.title_generator import wait_for_title_upgrades
             wait_for_title_upgrades()
-            store.flush_token_counts()
+            # A flush failure must not cost the turn its result: the work is already done and the
+            # reply is about to be delivered. Retry the pending receipt once, and if nothing is
+            # outstanding the store is healthy -- a refusal of ONE payload is not a statement about
+            # the store (#t_8c013181).
+            try:
+                store.flush_token_counts()
+            except Exception as flush_exc:
+                logger.warning('managed worker post-turn flush failed (%s); retrying pending outbox', flush_exc)
+                with contextlib.suppress(Exception):
+                    store.retry_pending()
+                if not store.journal.get('pending'):
+                    store.failure = None
             if result.get('final_response') is None and (result.get('interrupted') or result.get('failed')):
                 result['final_response'] = ''
             channel.send('result', result=result_frame(result))
             if not controls.finish.wait(30):
                 raise ValueError('managed_finish_timeout')
-            store.finish()
+            # The result is already delivered; a failed ``execution.finish`` cannot un-deliver it.
+            try:
+                store.finish()
+            except Exception as finish_exc:
+                logger.warning('managed worker execution.finish failed after result delivery: %s', finish_exc)
             channel.send('finished')
     finally:
         unregister_gateway_notify(frame['route'])
@@ -422,6 +437,13 @@ def execute(frame, channel):
             retire_agent(agent)
         try:
             store.close()
+        except Exception as close_exc:
+            # A cleanup-path exception never replaces the turn's outcome. Either the turn's work
+            # COMPLETED and its result was already delivered (so a raise here loses a finished
+            # turn and books a ``managed_worker_failed`` card), or the turn failed and its own
+            # exception is already propagating (so a raise here masks the real cause). Log it and
+            # let the turn's own outcome stand (#t_8c013181).
+            logger.warning('managed worker store.close() failed: %s', close_exc)
         finally:
             with contextlib.suppress(Exception):  # a failing socket close never replaces the turn's outcome
                 rpc.close()
@@ -449,6 +471,36 @@ def hello():
     return {'pid': me.pid, 'birth': worker_birth(me), 'ancestors': [p.pid for p in me.parents()[:3]]}
 
 
+#: The bounded cause codes a worker may name on the wire. The owner's card text is read by
+#: operators, and an exception's own message can carry a path, a prompt fragment or a credential,
+#: so the cause is drawn from this closed vocabulary or not sent at all.
+WORKER_FAILURE_CAUSES = frozenset({
+    # The worker's own persistence refusals (agent/runtime_session_store.py).
+    'invalid_params', 'outbox_closed', 'outbox_full', 'outbox_in_use', 'outbox_oversized',
+    'outbox_scope_mismatch', 'owner_unavailable', 'pending_receipt', 'permission_denied',
+    'synchronous_rpc_on_event_loop', 'synchronous_self_rpc', 'unsafe_outbox',
+    'unsupported_operation',
+    # The owner's refusals that reach the worker over worker.persist.
+    'admission_conflict', 'not_found', 'stale_epoch', 'stale_generation', 'unknown_execution',
+})
+
+
+def _bounded_cause(exc: BaseException) -> str:
+    """The bounded code naming WHY the worker failed, or ``''`` when nothing safe can be said.
+
+    The failure that lost whole turns was a persistence refusal whose code the owner already
+    speaks (``invalid_params``, ``outbox_full``), yet the card said only ``managed_worker_failed``
+    and the operator had no way to tell a refused payload from a dead interpreter. This maps the
+    exception to that closed vocabulary; anything else (an OSError with a path in it, a provider
+    error with a token in it) is NOT sent, because the card text is operator-facing.
+    """
+    from agent.runtime_session_store import WorkerPersistenceError
+    from hermes_state_runtime import RuntimeStoreError
+    code = exc.reason if isinstance(exc, RuntimeStoreError) else (
+        str(exc) if isinstance(exc, WorkerPersistenceError) else '')
+    return code if code in WORKER_FAILURE_CAUSES else ''
+
+
 def main():
     channel = WorkerChannel(os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0))  # windows-footgun: ok — binary frames
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
@@ -462,10 +514,12 @@ def main():
         channel.send('hello', **hello())
         frame = validate_bootstrap(read_frame(sys.stdin.buffer))
         execute(frame, channel)
-    except Exception:
-        # Runtime exceptions can contain credentials; the owner gets no raw traceback.
+    except Exception as exc:
+        # Runtime exceptions can contain credentials; the owner gets no raw traceback. The reason
+        # is a BOUNDED code the owner already understands, so the card says WHICH refusal killed
+        # the turn instead of a bare ``managed_worker_failed`` (#t_8c013181).
         logger.exception('managed worker failed')
-        channel.send('error', reason='managed_worker_failed')
+        channel.send('error', reason='managed_worker_failed', cause=_bounded_cause(exc))
         return 1
     finally:
         channel.stream.close()

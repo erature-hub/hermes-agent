@@ -47,6 +47,20 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+class WorkerOutboxFull(WorkerPersistenceError):
+    """A payload the journal cannot hold, refused *before* anything is written.
+
+    Never latches ``RuntimeSessionStore.failure``. A capacity refusal is a statement about the
+    caller's payload, not about the store's health: the journal on disk is untouched, nothing is
+    outstanding, and the next attempt -- a smaller payload, a chunked append, or a fresh worker
+    execution -- can succeed. Latching it instead turned one oversized transcript prune into a
+    lost turn and a ``managed_worker_failed`` card: the latched error then failed
+    ``refresh_session_turn_lease``, the lease-loss guard hard-interrupted the agent mid-stream, and
+    ``close()`` re-raised it past the point where the result had already been produced
+    (#t_8c013181).
+    """
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -302,8 +316,12 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             raise WorkerPersistenceError('outbox_closed')
         encoded = json.dumps(journal, ensure_ascii=True, allow_nan=False, separators=(',', ':')).encode()
         if len(encoded) > self.max_bytes:
-            self.failure = 'outbox_full'
-            raise WorkerPersistenceError(self.failure)
+            # A capacity refusal is decided BEFORE any write: the journal on disk still matches
+            # ``self.journal`` and nothing is outstanding, so the next attempt is free to be a
+            # smaller payload. Latching it poisoned every later call on this store -- including
+            # the liveness-critical ``refresh_session_turn_lease`` -- and turned one oversized
+            # write into a lost turn (#t_8c013181).
+            raise WorkerOutboxFull('outbox_full')
         from utils import atomic_write_bytes
         # Owner-only journal (the dir is 0700 too); the rename and its directory entry are durable.
         atomic_write_bytes(self.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)
@@ -324,11 +342,32 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             candidate['next_sequence'] += 1
             try:
                 self._save(candidate)
+            except WorkerOutboxFull:
+                # Capacity refusal decided before any write: the journal on disk still matches
+                # ``self.journal`` and nothing is outstanding, so the next attempt is free to be a
+                # smaller payload. Latching here would poison every later call on this store --
+                # including the liveness-critical ``refresh_session_turn_lease``.
+                raise
             except Exception as exc:
                 self.failure = str(exc)
                 raise
+            prior = self.journal
             self.journal = candidate
-            return self.retry_pending()[0]
+            try:
+                return self.retry_pending()[0]
+            except WorkerPersistenceError as exc:
+                if str(exc) == 'invalid_params':
+                    # A pre-commit refusal by the owner: no receipt was written and the owner's
+                    # ``last_sequence`` is unchanged, so this entry can never land as written.
+                    # Roll it back and clear the latch: a refusal of ONE payload is not a statement
+                    # about the store's health, and latching it failed
+                    # ``refresh_session_turn_lease`` (which hard-interrupted the agent mid-stream)
+                    # and then re-raised out of ``close()`` -- turning a completed turn into a
+                    # lost one and a ``managed_worker_failed`` card (#t_8c013181).
+                    self._save(prior)
+                    self.journal = prior
+                    self.failure = None
+                raise
 
     def retry_pending(self):
         with self.lock:
