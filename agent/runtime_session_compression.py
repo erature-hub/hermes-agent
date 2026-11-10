@@ -74,12 +74,15 @@ class RuntimeSessionCompressionMixin:
         carried = [dict(m) for m in carried_messages or [] if isinstance(m, dict)]
         unresolved = None if unresolved_held is None else [dict(m) for m in unresolved_held if isinstance(m, dict)]
         # The lease-less staleness fence (#124102): the owner re-verifies the caller's held rows
-        # inside its commit transaction. The projection keeps the closed handoff fields plus the
-        # persistence marker the CAS compare reads; anything else stays worker-local.
-        from hermes_state_runtime import HANDOFF_MESSAGE_FIELDS
+        # inside its commit transaction. The projection keeps only the fields ``held_row_mismatches``
+        # reads (when ``_db_row_snapshot`` is present, the digest comparison runs without ``content``,
+        # ``tool_calls`` or reasoning sidecars; otherwise identity fields without reasoning sidecars).
         cas = None if held_for_cas is None else [
             {k: v for k, v in m.items()
-             if k in HANDOFF_MESSAGE_FIELDS or k == '_db_persisted'}
+             if k in ({'_row_id', '_db_persisted', '_db_row_snapshot', 'message_uid', 'role'}
+                      if isinstance(m.get('_db_row_snapshot'), str)
+                      else {'_row_id', '_db_persisted', '_db_row_snapshot', 'message_uid',
+                            'role', 'content', 'tool_call_id', 'tool_calls'})}
             for m in held_for_cas if isinstance(m, dict)]
         result = self._apply('compression.archive', dict(messages=_handoff_rows(compacted_messages),
             model_config_patch=model_config_patch, watermark=watermark, lock_holder=lock_holder,

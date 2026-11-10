@@ -548,6 +548,17 @@ def _stopped_before_spawn(authority, ref, row):
     return True
 
 
+def _worker_failure_cause(cause) -> str:
+    """The worker's bounded cause code, kept only when it is one the owner already speaks.
+
+    The worker sends its cause in a closed vocabulary (``agent.managed_worker.WORKER_FAILURE_CAUSES``);
+    this re-checks it against that same set, because the value reaches an operator-facing card and
+    an unrecognised string is dropped rather than printed (#t_8c013181).
+    """
+    from agent.managed_worker import WORKER_FAILURE_CAUSES
+    return cause if isinstance(cause, str) and cause in WORKER_FAILURE_CAUSES else ''
+
+
 def _record_lost_attempt(authority, policy, exc, reason, scope):
     """Start the board disposition (``worker_lost``) for a lost Kanban card attempt; the task, or None.
 
@@ -679,8 +690,13 @@ async def execute_managed(authority, ref, row, policy):
             with authority.sessions[ref.session_id].event_stream.lock:
                 if _prompt_frame(authority, ref, row, worker, frame):
                     continue
-            if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
-                raise RuntimeStoreError('managed_worker_failed')
+            if frame.get('type') == 'error' and frame.get('reason') == 'managed_worker_failed':
+                # The worker names the bounded cause it died of, so the card says WHICH refusal
+                # killed the turn instead of a bare ``managed_worker_failed``. The cause is
+                # re-checked against the same closed vocabulary the worker used: an unrecognised
+                # one is dropped rather than written onto an operator-facing card (#t_8c013181).
+                raise RuntimeStoreError('managed_worker_failed',
+                                        detail=_worker_failure_cause(frame.get('cause')))
             kind = frame.get('type')
             if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
                 continue
@@ -712,6 +728,13 @@ async def execute_managed(authority, ref, row, policy):
     except (Exception, asyncio.CancelledError) as exc:
         import logging
         reason = exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__
+        # The card's error text is built from this reason, so a bounded cause rides along with it:
+        # the operator reads "managed worker lost: managed_worker_failed (invalid_params)" and
+        # knows the turn was refused, not that the interpreter died for an unknown reason
+        # (#t_8c013181). The cause is already validated against the closed vocabulary above.
+        cause = getattr(exc, 'detail', '') if isinstance(exc, RuntimeStoreError) else ''
+        if reason == 'managed_worker_failed' and cause:
+            reason = f'{reason} ({cause})'
         logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
         if scope is None:
             if isinstance(exc, asyncio.CancelledError) or (
