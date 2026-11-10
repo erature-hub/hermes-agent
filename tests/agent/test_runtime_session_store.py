@@ -252,3 +252,102 @@ def test_the_prune_refusal_names_its_cause_on_the_card(tmp_path):
     assert _bounded_cause(OSError(r'C:\Users\someone\secret.db is locked')) == ''
     assert _bounded_cause(ValueError('api_key=sk-live-1234')) == ''
     assert _bounded_cause(RuntimeError()) == ''
+
+
+def test_the_default_journal_ceiling_carries_a_compaction_commit(tmp_path):
+    """A compaction commit ships the transcript TWICE, so its receipt is far larger than a message.
+
+    The refused writes measured on this host ran 4.05MiB to 11.02MiB (49 refusals, every one of
+    them a ``compression.archive`` whose ``held_for_cas`` projection shipped the full content and
+    reasoning of every row). A 4MiB ceiling refused all of them, and the refusal is what latched
+    the store and lost the turn (#t_8c013181). The ceiling must carry the real payload.
+    """
+    from agent.runtime_session_store import DEFAULT_OUTBOX_MAX_BYTES
+
+    assert DEFAULT_OUTBOX_MAX_BYTES >= 16 * 1024 * 1024
+
+    sent = []
+
+    def commit(method, **params):
+        rows = params['payload']['messages']
+        sent.append(rows)
+        return {'count': len(rows), 'annotations': [{'_row_id': 1} for _ in rows]}
+
+    # A payload of the measured worst case (11.02MiB) must be accepted by the default ceiling.
+    payload = [{'role': 'tool', 'content': 'x' * 60_000} for _ in range(190)]
+    store = RuntimeSessionStore(commit, {'session_id': 's'}, tmp_path / 'private')
+    try:
+        store.append_messages_batch('s', payload)
+        assert sent and len(sent[0]) == len(payload)
+    finally:
+        store.close()
+
+
+def test_the_cas_projection_ships_only_what_the_fence_reads(tmp_path):
+    """The refusal was a SIZE refusal, and ``held_for_cas`` was most of the size.
+
+    The measured refused writes were ``compression.archive`` receipts of 4.05MiB to 11.02MiB whose
+    row count was 72 to 470 -- far under the owner's 1000-row limit, so the payload SIZE was the
+    trigger. ``held_for_cas`` is the projection the owner's CAS fence reads, and the fence compares
+    a row by its stored snapshot (``_db_row_snapshot``) or, failing that, by its identity
+    (``role``, ``content``, ``tool_call_id``, ``tool_calls``). It never reads the reasoning
+    sidecars, so shipping them was pure size: the same projection cut one measured 11.02MiB
+    receipt to 5.51MiB (#t_8c013181).
+    """
+    held = [{
+        'role': 'assistant',
+        'content': 'c' * 50_000,
+        'reasoning': 'r' * 200_000,
+        'reasoning_content': 'rc' * 100_000,
+        'reasoning_details': [{'type': 'reasoning.text', 'text': 'd' * 100_000}],
+        'codex_reasoning_items': [{'x': 'i' * 100_000}],
+        '_row_id': 1,
+        '_db_persisted': True,
+        '_db_row_snapshot': 'snap-1',
+        'message_uid': 'uid-1',
+    }]
+    compacted = [{'role': 'assistant', 'content': 'pruned', '_row_id': 1}]
+    sent = []
+
+    def commit(method, **params):
+        sent.append(params['payload'])
+        return {'value': 1, 'annotations': [{'_row_id': 1}]}
+
+    store = RuntimeSessionStore(commit, {'session_id': 's'}, tmp_path / 'private')
+    try:
+        store.archive_and_compact('s', compacted, held_for_cas=held)
+    finally:
+        store.close()
+    cas = sent[0]['held_for_cas'][0]
+    # The fields the CAS compare reads are present...
+    assert cas['_row_id'] == 1 and cas['_db_persisted'] is True
+    assert cas['_db_row_snapshot'] == 'snap-1' and cas['message_uid'] == 'uid-1'
+    assert cas['role'] == 'assistant'
+    # ...and the fields it never reads (the reasoning sidecars) are NOT shipped.
+    for absent in ('reasoning', 'reasoning_content', 'reasoning_details', 'codex_reasoning_items'):
+        assert absent not in cas, f'{absent} is not read by the fence, so it is pure payload size'
+
+
+def test_a_row_without_a_snapshot_still_carries_what_the_fence_falls_back_to(tmp_path):
+    """Without a snapshot the fence compares identity fields, so those must still be shipped."""
+    held = [{
+        'role': 'tool', 'content': 'the result', 'tool_call_id': 'call-1',
+        'tool_calls': [{'id': 'call-1', 'type': 'function', 'function': {'name': 'terminal'}}],
+        'reasoning': 'r' * 100_000,
+        '_row_id': 7, '_db_persisted': True, 'message_uid': 'uid-7',
+    }]
+    sent = []
+
+    def commit(method, **params):
+        sent.append(params['payload'])
+        return {'value': 1, 'annotations': [{'_row_id': 7}]}
+
+    store = RuntimeSessionStore(commit, {'session_id': 's'}, tmp_path / 'private')
+    try:
+        store.archive_and_compact('s', [{'role': 'tool', 'content': 'x', '_row_id': 7}], held_for_cas=held)
+    finally:
+        store.close()
+    cas = sent[0]['held_for_cas'][0]
+    assert cas['content'] == 'the result' and cas['tool_call_id'] == 'call-1'
+    assert cas['tool_calls'] and cas['role'] == 'tool'
+    assert 'reasoning' not in cas

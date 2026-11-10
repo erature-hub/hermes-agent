@@ -20,6 +20,18 @@ from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
 
+# The per-write journal ceiling. A worker's outbox carries at most one pending entry (``_apply``
+# refuses while another is outstanding), so this bounds a single payload, not the accumulated file.
+# 4MiB was below the real cost of the writes that flow through it: a compaction commit ships the
+# message list twice (``messages`` plus the ``held_for_cas`` projection the owner's CAS fence
+# reads), and the refused writes measured on this host ran 4.05MiB to 11.02MiB (worst observed
+# 11.02MiB, over 49 refusals). 16MiB keeps ~1.5x headroom over that worst case.
+DEFAULT_OUTBOX_MAX_BYTES = 16 * 1024 * 1024
+# Reload is deliberately NOT bounded by the write ceiling: a journal larger than what this version
+# would write is exactly the state a stuck execution has to be able to open and drain. It is bounded
+# only by a hard memory ceiling, so a corrupt/hostile file cannot be read unbounded.
+OUTBOX_RELOAD_CEILING = 64 * 1024 * 1024
+
 _worker_process = False
 
 
@@ -170,7 +182,7 @@ class WorkerRPC:
         # No library keepalive: its pong deadline would run independently of (and could fail) a call
         # inside its receipt budget; that budget and the observed close are the liveness checks.
         self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=5, close_timeout=1,
-                                       max_size=8 * 1024 * 1024, proxy=None, ping_interval=None))
+                                       max_size=OUTBOX_RELOAD_CEILING, proxy=None, ping_interval=None))
         return self.link
 
     def _drop(self):
@@ -230,14 +242,15 @@ from agent.runtime_session_lifecycle import RuntimeSessionLifecycleMixin
 class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycleMixin):
     """Synchronous durable results with a private byte-bounded retry journal.
 
-    A failed write remains pending, and failure is sticky until explicit retry or
-    adoption. Local queue acceptance is never returned as canonical commit.
-    Pending journals live outside age-pruned cache trees.
+    A failed write remains pending, and a *durability* failure is sticky until explicit retry or
+    adoption. A *capacity* refusal (``WorkerOutboxFull``) is not: it is decided before any write and
+    never latches, so the same store can carry the next, smaller write. Local queue acceptance is
+    never returned as canonical commit. Pending journals live outside age-pruned cache trees.
     """
     # The process's async-delegation ledger belongs to the adopted execution, never a reserved child.
     binds_delegation_ledger = True
 
-    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
+    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=DEFAULT_OUTBOX_MAX_BYTES):
         self.rpc = rpc
         self.scope = dict(scope)
         self.max_bytes = max_bytes
@@ -259,8 +272,17 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             raise WorkerPersistenceError('outbox_in_use')
         try:
             if self.path.exists():
-                if self.path.stat().st_size > max_bytes:
-                    raise WorkerPersistenceError('outbox_full')
+                size = self.path.stat().st_size
+                if size > OUTBOX_RELOAD_CEILING:
+                    raise WorkerPersistenceError('outbox_oversized')
+                if size > max_bytes:
+                    # Opening must not be gated on the write ceiling: an execution whose own journal
+                    # is already this large has to be able to replay it and shrink it, otherwise the
+                    # outbox bricks every subsequent attempt at that execution_id with no way out
+                    # but deleting the directory by hand.
+                    logger.warning('outbox journal %s is %.1fMiB, above the %.1fMiB write ceiling; '
+                                   'opening it to drain rather than refusing the execution',
+                                   self.path, size / 1048576, max_bytes / 1048576)
                 self.journal = json.loads(self.path.read_text(encoding="utf-8-sig"))
                 reconciled = self.journal['scope'] != self.scope
                 if reconciled:
@@ -307,20 +329,18 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     entry['operation'] == 'compression.publish' for entry in self.journal['pending']))):
             raise WorkerPersistenceError('outbox_scope_mismatch')
         candidate = dict(self.journal, scope=dict(old, epoch=new['epoch']))
-        self._save(candidate)
+        self._save(candidate, ceiling=OUTBOX_RELOAD_CEILING)  # scope-only rewrite, never new payload
         self.scope = candidate['scope']
         self.journal = candidate
 
-    def _save(self, journal):
+    def _save(self, journal, *, ceiling=None):
         if self._outbox_owner.closed:
             raise WorkerPersistenceError('outbox_closed')
         encoded = json.dumps(journal, ensure_ascii=True, allow_nan=False, separators=(',', ':')).encode()
-        if len(encoded) > self.max_bytes:
-            # A capacity refusal is decided BEFORE any write: the journal on disk still matches
-            # ``self.journal`` and nothing is outstanding, so the next attempt is free to be a
-            # smaller payload. Latching it poisoned every later call on this store -- including
-            # the liveness-critical ``refresh_session_turn_lease`` -- and turned one oversized
-            # write into a lost turn (#t_8c013181).
+        limit = self.max_bytes if ceiling is None else ceiling
+        if len(encoded) > limit:
+            # Refused before the file is touched: nothing is pending, nothing on disk changed, and
+            # nothing here is unsafe to forget. Latching this was the defect that cost whole turns.
             raise WorkerOutboxFull('outbox_full')
         from utils import atomic_write_bytes
         # Owner-only journal (the dir is 0700 too); the rename and its directory entry are durable.
@@ -364,7 +384,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     # ``refresh_session_turn_lease`` (which hard-interrupted the agent mid-stream)
                     # and then re-raised out of ``close()`` -- turning a completed turn into a
                     # lost one and a ``managed_worker_failed`` card (#t_8c013181).
-                    self._save(prior)
+                    self._save(prior, ceiling=OUTBOX_RELOAD_CEILING)  # scope-only rewrite, never new payload
                     self.journal = prior
                     self.failure = None
                 raise
@@ -378,7 +398,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     result = self.rpc('worker.persist', **self.scope, **entry)
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
-                    self._save(candidate)
+                    # A drain only ever shrinks the journal, so it is bounded by the reload ceiling
+                    # and not the write ceiling: otherwise a journal this execution already owns and
+                    # is trying to empty would refuse to be emptied, and stay stuck forever.
+                    self._save(candidate, ceiling=OUTBOX_RELOAD_CEILING)
                     self.scope = candidate['scope']
                     self.journal = candidate
                     results.append(result)
@@ -392,7 +415,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         """Install only a separately verified worker.adopt result; never self-adopt."""
         with self.lock:
             candidate = dict(self.journal, scope=dict(self.scope, epoch=epoch))
-            self._save(candidate)
+            self._save(candidate, ceiling=OUTBOX_RELOAD_CEILING)  # scope-only rewrite, never new payload
             self.scope = candidate['scope']
             self.journal = candidate
             self.failure = None
