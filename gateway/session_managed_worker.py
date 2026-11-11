@@ -716,7 +716,20 @@ async def execute_managed(authority, ref, row, policy):
         # The deadline is derived from the spawn cost this host actually pays (see
         # ``_hello_deadline_seconds``), so a busy host that boots workers slowly does not
         # declare them wedged (#t_853294b3).
-        hello = await worker.next_frame(_hello_deadline_seconds(authority), ack=0)
+        _hello_deadline = _hello_deadline_seconds(authority)
+        try:
+            hello = await worker.next_frame(_hello_deadline, ack=0)
+        except RuntimeStoreError as exc:
+            # A TIMEOUT is also evidence of what the boot costs. Recording only SUCCESSFUL
+            # handshakes left the derivation inert in the one case it exists for: a host so
+            # slow that every handshake times out records nothing, so the deadline stays
+            # pinned at its floor and the next attempt times out identically (#t_45f5d3c4:
+            # 16 attempts, the handshake wait flat at ~61s every time). The deadline this
+            # attempt EXHAUSTED is a lower bound on the boot, so it is the cost to learn
+            # from — the next attempt waits proportionally longer instead of repeating this.
+            if exc.reason == HELLO_TIMEOUT_BOOKING:
+                _record_hello_cost(authority, _hello_deadline)
+            raise
         # The handshake this profile just paid is the next one's deadline basis: the child's
         # boot cost (PM probe included) is what the wait has to cover (#t_853294b3).
         _record_hello_cost(authority, time.monotonic() - _hello_started_at)

@@ -1582,6 +1582,19 @@ def check_respawn_guard(
             ended_at = _kb._to_epoch(latest_run["ended_at"])
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
+    # An infrastructure loss that BOOKED AS A CRASH needs the same spacing. The host never
+    # got the worker started, so the card's work never began — but the run's outcome is
+    # ``crashed``, not ``spawn_failed``, so the branch above does not see it. Without this
+    # the card re-spawns on the very next tick: a host that is too slow to boot a worker
+    # is too slow for the NEXT one too, so the attempt fails identically and the card
+    # hot-loops (#t_45f5d3c4: 16 consecutive attempts in 45 minutes, one every ~2.8
+    # minutes, each burning a worker slot). The cooldown lets the host catch up; the card
+    # stays retryable forever because an infrastructure loss never charges the breaker.
+    if latest_run is not None and latest_run["outcome"] == "crashed":
+        if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
+            ended_at = _kb._to_epoch(latest_run["ended_at"])
+            if ended_at is not None and (now - ended_at) < rl_cooldown:
+                return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
