@@ -283,7 +283,14 @@ def reap_worker_zombies() -> list[int]:
     reaped: list[int] = []
     if _kb._IS_WINDOWS:
         for pid, proc in list(_live_worker_procs.items()):
-            returncode = proc.poll()
+            # The registry is module-global and outlives any single caller, so
+            # an entry parked by a stand-in (a test's fake Popen, say) can still
+            # be in it. A handle that cannot report an exit status must not
+            # abort the whole tick, so skip it instead of raising.
+            poll = getattr(proc, "poll", None)
+            if not callable(poll):
+                continue
+            returncode = poll()
             if returncode is None:
                 continue
             _record_worker_exit(pid, _wait_status_from_returncode(returncode))
