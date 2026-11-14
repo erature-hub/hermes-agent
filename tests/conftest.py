@@ -476,6 +476,66 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
     monkeypatch.setattr(_kbd_mod, "_system_memory_sample", dict, raising=False)
 
 
+# Every copy of ``hermes_cli.kanban_db_dispatch`` seen so far. The registries
+# below are module globals, so each copy carries its own, and a few test files
+# purge ``sys.modules`` of the ``hermes_cli`` modules and import the dispatcher
+# again -- which leaves a second copy (with a second pair of registries) alive
+# for the rest of the session. A registry that is not isolated is a registry
+# the next test can still be poisoned by, so the set grows as copies appear.
+_KANBAN_DISPATCH_MODULES: list = []
+
+
+def _kanban_dispatch_modules(request) -> list:
+    """The ``kanban_db_dispatch`` module objects this test could be using."""
+    candidates = [sys.modules.get("hermes_cli.kanban_db_dispatch")]
+    test_module = getattr(request.node, "module", None)
+    if test_module is not None:
+        # A test file that bound the dispatcher at import time holds the copy
+        # that was current then, which a later ``sys.modules`` purge does not
+        # replace. Scan the test module's own namespace to reach it.
+        candidates.extend(vars(test_module).values())
+
+    known = {id(m): m for m in _KANBAN_DISPATCH_MODULES}
+    for candidate in candidates:
+        if getattr(candidate, "__name__", "") != "hermes_cli.kanban_db_dispatch":
+            continue
+        known.setdefault(id(candidate), candidate)
+    _KANBAN_DISPATCH_MODULES[:] = list(known.values())
+    return _KANBAN_DISPATCH_MODULES
+
+
+@pytest.fixture(autouse=True)
+def _isolate_kanban_worker_registries(request, monkeypatch):
+    """Give every test the kanban dispatcher's worker registries to itself.
+
+    ``kanban_db_dispatch`` keeps two module-global registries: the handles of
+    live worker processes (``_live_worker_procs``) and the exit statuses it has
+    reaped (``_recent_worker_exits``). ``_default_spawn`` registers every
+    handle it starts in the first, and ``reap_worker_zombies`` polls each one.
+
+    Neither registry is ever reset, so a test that starts a worker through a
+    stand-in ``Popen`` leaves that stand-in behind for every later test: the
+    next dispatch tick polls it and dies with ``AttributeError: 'FakeProc'
+    object has no attribute 'poll'``. That crash lands in whichever test ran
+    later rather than in the one that caused it, which makes the suite
+    order-dependent and turns every new dispatch-level test into a coin flip.
+
+    Both registries are process-local by nature, so isolating them per test
+    costs no shared state: each test starts from an empty registry and leaves
+    nothing behind. This lives in the ROOT conftest rather than in
+    ``tests/hermes_cli/conftest.py`` because the leak crosses package
+    boundaries -- a stand-in parked by a gateway test reaches a ``hermes_cli``
+    test the same way.
+    """
+    try:
+        import hermes_cli.kanban_db_dispatch
+    except Exception:
+        return
+    for module in _kanban_dispatch_modules(request):
+        monkeypatch.setattr(module, "_live_worker_procs", {})
+        monkeypatch.setattr(module, "_recent_worker_exits", {})
+
+
 @pytest.fixture(autouse=True)
 def _neutralize_git_safe_directory_read(request, monkeypatch):
     """Skip the ``git config --get-all safe.directory`` pre-read in ``noninteractive_git_env()``.

@@ -1,3 +1,9 @@
+# health: allow FILE_LINES -- test-isolation fix: the dispatcher's live-worker
+# registry is module-global, so a stand-in Popen parked by one test is polled by
+# every later dispatch tick and aborts it. The added lines are one minimal
+# defensive branch (skip a handle that cannot report an exit status) at that
+# existing chokepoint; the leak's real fix is the per-test isolation fixture in
+# tests/conftest.py, which this guard only backs up.
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
@@ -283,7 +289,13 @@ def reap_worker_zombies() -> list[int]:
     reaped: list[int] = []
     if _kb._IS_WINDOWS:
         for pid, proc in list(_live_worker_procs.items()):
-            returncode = proc.poll()
+            # The registry is module-global and outlives any single caller, so an
+            # entry parked by a stand-in can still be in it. A handle that cannot
+            # report an exit status must not abort the whole tick: skip it.
+            poll = getattr(proc, "poll", None)
+            if not callable(poll):
+                continue
+            returncode = poll()
             if returncode is None:
                 continue
             _record_worker_exit(pid, _wait_status_from_returncode(returncode))
