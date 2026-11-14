@@ -11,10 +11,17 @@ dispatch-level test into a coin flip.
 
 Two invariants are pinned here: the reaper tolerates a registry entry that
 cannot report an exit status, and no test inherits another's registry.
+
+The reaper only polls the registry on Windows -- ``_default_spawn`` parks a
+handle there under ``_IS_WINDOWS``, and POSIX reaps children with ``waitpid``
+instead -- so the poll branch is native-Windows behaviour. The tests that
+exercise it therefore run on the Windows host for real, never against a
+patched platform flag (see ``tests/AGENTS.md``: "Don't fake the host OS").
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -34,32 +41,27 @@ class _StandIn:
         self.pid = pid
 
 
-@pytest.fixture
-def windows_reaper(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run the Windows poll-based reaper on every host.
-
-    Only the Windows branch polls the registry; POSIX reaps via ``waitpid``.
-    Forcing the branch makes the invariant meaningful on every host, not just
-    on the one where the leak bites.
-    """
-    monkeypatch.setattr(kbd._kb, "_IS_WINDOWS", True)
-
-
-def test_the_reaper_survives_a_registry_entry_that_cannot_report_a_status(
-    windows_reaper: None,
-) -> None:
+@pytest.mark.platforms("windows")
+def test_the_reaper_survives_a_registry_entry_that_cannot_report_a_status() -> None:
     """A stand-in left in the registry must not abort the dispatch tick.
 
     The registry is module-global and outlives any single caller, so an entry
     parked by a stand-in can still be in it when the next tick polls. A handle
     that cannot report an exit status is skipped, not raised on.
     """
+    # Native Windows, nothing patched: the poll-based reaper is the branch
+    # under test, so the host must be the one that has it. ``os.WIFEXITED``
+    # is absent here and present on POSIX, which is what makes this proof
+    # that the branch really ran rather than being simulated.
+    assert not hasattr(os, "WIFEXITED")
+
     kbd._live_worker_procs[424_242] = _StandIn(424_242)
 
     assert kbd.reap_worker_zombies() == []
 
 
-def test_a_reapable_registry_entry_is_still_reaped(windows_reaper: None) -> None:
+@pytest.mark.platforms("windows")
+def test_a_reapable_registry_entry_is_still_reaped() -> None:
     """The tolerance above must not cost the normal path its reaped PIDs."""
     proc = subprocess.Popen([sys.executable, "-c", "raise SystemExit(0)"])
     proc.wait()
