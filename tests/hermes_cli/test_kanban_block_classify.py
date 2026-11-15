@@ -49,7 +49,7 @@ def test_typed_block_classifies_untyped_breaker_block(kanban_home, monkeypatch):
         assert kb.block_task(conn, tid, reason="needs a human decision", kind="needs_input") is True
 
         after = kb.get_task(conn, tid)
-        assert (after.status, after.block_kind, after.block_recurrences) == ("blocked", "needs_input", 1)
+        assert (after.status, after.block_kind, after.block_recurrences) == ("review", "needs_input", 1)
         assert after.consecutive_failures == parked.consecutive_failures
         assert after.last_failure_error == parked.last_failure_error
         assert after.current_run_id is None

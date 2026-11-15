@@ -1239,6 +1239,29 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
+_INFRA_WORKER_OUTPUT_MARKERS = (
+    "Gateway draining:",
+    "service_manager_unavailable",
+    "Gateway inaccessible:",
+    "Kanban execution unknown; retained by owner",
+)
+
+
+def _is_infrastructure_worker_loss(dead: _DeadWorker) -> bool:
+    """True when a dead worker reflects a host/gateway/resume interruption, not a task crash."""
+    attempt_note = str(dead.event_payload.get("attempt_note") or "")
+    worker_out = str(dead.event_payload.get("worker_output") or "")
+    if any(m in worker_out for m in _INFRA_WORKER_OUTPUT_MARKERS):
+        return True
+    if "owner admission settled interrupted" in attempt_note:
+        return True
+    # Bare dead PID with no exit code, no worker output, and no worker_lost event
+    # (e.g. session resumed / host restarted and no worker exists on the PID).
+    if dead.kind == "unknown" and not worker_out and not dead.event_payload.get("worker_lost"):
+        return True
+    return False
+
+
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
@@ -1246,11 +1269,17 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
     systemic same-error crashes (>= 3 identical fingerprints this tick) and
     terminal provider errors (credential revoked, model gone — a retry cannot
-    heal them) trip immediately.
+    heal them) trip immediately. Infrastructure/gateway/session-resume worker
+    losses leave ``consecutive_failures`` untouched so the card restarts.
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
+        if _is_infrastructure_worker_loss(dead):
+            continue
+        attempt_note = str(dead.event_payload.get("attempt_note") or "")
+        if "managed worker lost: managed_worker_failed" in attempt_note:
+            continue
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
@@ -1299,8 +1328,22 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
+        elif _is_infrastructure_worker_loss(dead):
+            tripped = _record_task_failure(
+                conn, tid,
+                error=error_text,
+                outcome="crashed",
+                release_claim=False,
+                end_run=False,
+                infrastructure=True,
+                event_payload_extra={"pid": pid, "claimer": claimer, "infrastructure": True},
+            )
         else:
-            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+            attempt_note = str(dead.event_payload.get("attempt_note") or "")
+            is_systemic = (
+                "managed worker lost: managed_worker_failed" not in attempt_note
+                and fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+            )
             extra = {"pid": pid, "claimer": claimer}
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
@@ -1575,11 +1618,13 @@ def check_respawn_guard(
     passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, block_kind FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
+    if lane == "review" and _kb._row_get(row, "block_kind") == "needs_input":
+        return "needs_human_input"
 
     now = int(time.time())
 

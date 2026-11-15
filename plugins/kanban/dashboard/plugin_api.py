@@ -1032,6 +1032,7 @@ def specify_task_endpoint(task_id: str, payload: SpecifyBody, board: Optional[st
 
 class ReassignBody(BaseModel):
     profile: Optional[str] = None  # "" or None = unassign
+    assignee: Optional[str] = None
     reclaim_first: bool = False
     reason: Optional[str] = None
 
@@ -1040,14 +1041,15 @@ class ReassignBody(BaseModel):
 def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[str] = Query(None)):
     """Reassign to another profile, optionally reclaiming first
     (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
+    target = (payload.assignee if payload.assignee is not None else payload.profile) or None
     with _board_conn(board) as (board, conn):
         ok = kanban_db.reassign_task(
-            conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
+            conn, task_id, target, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
         if not ok:
             raise _conflict(
                 f"cannot reassign {task_id}: unknown id, or still "
                 "running (pass reclaim_first=true to release the claim first)")
-        return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
+        return {"ok": True, "task_id": task_id, "assignee": target}
 
 
 # Estimate: rough token/complexity read via the auxiliary model. NOT a dollar cost.

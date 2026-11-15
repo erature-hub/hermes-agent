@@ -236,6 +236,36 @@ def test_a_settled_receipt_with_a_live_gateway_owner_no_longer_holds_the_claim(b
     assert board.state("t_gateway")["status"] == "ready"
 
 
+def test_infra_worker_losses_and_managed_worker_storm_restart_without_blocking(board):
+    """Gateway-drain / interrupted-admission / dead-PID losses must not block cards."""
+    # 3 cards hit managed_worker_failed in one tick -> must NOT trip is_systemic at 1.
+    for i in range(3):
+        board.running(f"t_storm_{i}", claim_expires_in=900, heartbeat_age=30,
+                      worker_lost="managed_worker_failed")
+    # 1 card with owner admission settled interrupted + dead PID -> infrastructure, 0 failures.
+    board.running("t_interrupted", claim_expires_in=900, heartbeat_age=30,
+                  owner=True, admission=("terminal", "interrupted"))
+    # 1 card with bare dead PID (no worker output, no worker_lost) -> infrastructure, 0 failures.
+    board.running("t_deadpid", claim_expires_in=900, heartbeat_age=30, owner=False)
+    board.tick(failure_limit=3)
+    for i in range(3):
+        assert board.state(f"t_storm_{i}")["status"] == "ready"
+    assert board.state("t_interrupted")["status"] == "ready"
+    assert board.state("t_interrupted")["consecutive_failures"] == 0
+    assert board.state("t_deadpid")["status"] == "ready"
+    assert board.state("t_deadpid")["consecutive_failures"] == 0
+
+
+def test_needs_input_routes_to_review_and_is_guarded_from_ai_review_dispatch(board):
+    """needs_input cards go to review for human attention and are not auto-claimed by sdlc-review."""
+    board.running("t_ask", claim_expires_in=900, heartbeat_age=30, owner=False)
+    assert kb.block_task(board.conn, "t_ask", reason="Which option?", kind="needs_input") is True
+    assert board.state("t_ask")["status"] == "review"
+    assert kbd.check_respawn_guard(board.conn, "t_ask", lane="review") == "needs_human_input"
+    assert kb.unblock_task(board.conn, "t_ask") is True
+    assert board.state("t_ask")["status"] == "ready"
+
+
 # --- the reclaim's kill step: an absent pid is gone, not "survived" -----------------------
 
 @pytest.mark.parametrize("live", [False, True], ids=["absent-pid", "live-pid"])

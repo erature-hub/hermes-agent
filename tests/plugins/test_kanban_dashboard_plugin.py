@@ -963,6 +963,31 @@ def test_reassign_endpoint_switches_profile(client):
     finally:
         conn2.close()
 
+
+def test_reassign_endpoint_accepts_assignee_alias(client):
+    """POST /tasks/<id>/reassign accepts ``assignee`` so clients avoid body.profile."""
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="task", assignee="orig")
+    finally:
+        conn.close()
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t}/reassign",
+        json={"assignee": "sage", "reclaim_first": False},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["assignee"] == "sage"
+
+    conn2 = kbc.connect()
+    try:
+        row = conn2.execute(
+            "SELECT assignee FROM tasks WHERE id=?", (t,),
+        ).fetchone()
+        assert row["assignee"] == "sage"
+    finally:
+        conn2.close()
+
 # ---------------------------------------------------------------------------
 # Diagnostics endpoint (/api/plugins/kanban/diagnostics)
 # ---------------------------------------------------------------------------

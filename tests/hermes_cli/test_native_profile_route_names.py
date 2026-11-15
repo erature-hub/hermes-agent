@@ -80,3 +80,27 @@ def test_launch_home_guard_compares_home_keys_not_raw_paths(root, tmp_path):
         native_http._check_registry_scope(_request('DELETE', '/api/profiles/beta'),
                                           str(root / 'profiles' / 'beta'), str(link))
     assert Path(link).resolve() == root / 'profiles' / 'beta'
+
+
+def test_plugin_routes_allow_target_profile_in_json_body(root):
+    async def body_json():
+        return {'profile': 'beta', 'reclaim_first': True}
+
+    allowed = SimpleNamespace(
+        method='POST',
+        url=SimpleNamespace(path='/api/plugins/kanban/tasks/t_1/reassign'),
+        query_params=QueryParams('profile=sessions'),
+        headers=Headers({'content-type': 'application/json'}),
+        json=body_json,
+    )
+    asyncio.run(native_http._check_profile_scope(allowed, str(root / 'profiles' / 'sessions')))
+
+    disallowed = SimpleNamespace(
+        method='POST',
+        url=SimpleNamespace(path='/api/plugins/kanban/tasks/t_1/reassign'),
+        query_params=QueryParams('profile=beta'),
+        headers=Headers({'content-type': 'application/json'}),
+        json=body_json,
+    )
+    with pytest.raises(PermissionError):
+        asyncio.run(native_http._check_profile_scope(disallowed, str(root / 'profiles' / 'sessions')))

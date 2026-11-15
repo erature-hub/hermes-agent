@@ -507,7 +507,10 @@ export function nativeGrantPurpose(url: string, method = 'GET'): GatewayTicketPu
  *  JSON body's `profile`. The gateway checks both against the grant, and a session write such as
  *  `PATCH /api/sessions/<id>` names its owner in the body alone. */
 export function nativeGrantRoute(url: string, body?: unknown, method?: string): string {
-  if (scopedProfileOf(new URL(url), method)?.trim()) {return url}
+  const parsed = new URL(url)
+  if (scopedProfileOf(parsed, method)?.trim()) {return url}
+  // Plugin routes scope profile via ?profile= query params; JSON body `profile` is domain data.
+  if (parsed.pathname.startsWith('/api/plugins/')) {return url}
   const profile = body && typeof body === 'object' && !Array.isArray(body) ? (body as { profile?: unknown }).profile : undefined
 
   return typeof profile === 'string' && profile.trim() ? profile : url

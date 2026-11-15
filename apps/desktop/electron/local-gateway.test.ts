@@ -624,6 +624,9 @@ test('a session write that names its owner only in the body gets a grant for tha
   expect(nativeGrantRoute('http://127.0.0.1:1/api/profiles/active', { profile: 'p2' }, 'GET')).toBe('p2')
   expect(nativeGrantRoute('http://127.0.0.1:1/api/profiles/sessions/sidebar?recents_profile=p3', { profile: 'p2' })).toContain('recents_profile=p3')
 
+  // Plugin endpoints scope profile via ?profile= query params; JSON body `profile` (e.g. task target assignee) is not a grant target.
+  expect(nativeGrantRoute('http://127.0.0.1:1/api/plugins/kanban/tasks/t_1/reassign', { profile: 'p2' }, 'POST')).toBe('http://127.0.0.1:1/api/plugins/kanban/tasks/t_1/reassign')
+
   for (const body of [undefined, null, {}, { profile: '' }, { profile: 7 }, [{ profile: 'p2' }]]) {
     expect(nativeGrantRoute(url, body)).toBe(url)
   }

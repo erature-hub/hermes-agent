@@ -67,9 +67,12 @@ async def _check_profile_scope(request, profile_id):
                                    '/api/fs/download', '/api/fs/read-data-url'))
     for value in request.query_params.getlist('profile'):
         _own_profile(value, profile_id, current=current)
+    # /api/plugins/* routes scope profile strictly via ?profile= query params; JSON body
+    # fields named `profile` (e.g. kanban task reassign target) are plugin domain payloads.
     content_type = request.headers.get('content-type', '').split(';', 1)[0].strip().lower()
-    if not content_type or content_type == 'application/json' or (
-            content_type.startswith('application/') and content_type.endswith('+json')):
+    if not path.startswith('/api/plugins/') and (
+            not content_type or content_type == 'application/json' or (
+                content_type.startswith('application/') and content_type.endswith('+json'))):
         try:
             body = await request.json()
         except (ValueError, UnicodeError):

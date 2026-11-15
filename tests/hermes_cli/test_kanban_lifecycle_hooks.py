@@ -69,7 +69,8 @@ def test_claim_fires_hook(kanban_home, captured_hooks):
 
 @pytest.mark.parametrize(("kind", "status", "event"), [
     ("dependency", "todo", "dependency_wait"),
-    ("needs_input", "blocked", "blocked"),  # control: always post-commit
+    ("needs_input", "review", "blocked"),  # decision requests route to review
+    ("capability", "blocked", "blocked"),  # control: always post-commit
 ])
 def test_block_hook_runs_after_commit_with_write_lock_free(
     kanban_home, captured_hooks, kind, status, event,

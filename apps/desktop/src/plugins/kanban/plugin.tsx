@@ -5,8 +5,11 @@
  * through `ctx.rest` (namespace-scoped to `/api/plugins/kanban`). No new
  * backend, no core edits.
  *
- * Ships OFF by default (`defaultEnabled: false`): it inventories in
- * Capabilities ▸ Plugins and registers nothing until the user flips the switch.
+ * Ships ON by default (`defaultEnabled: true`): the Kanban board is the fleet's
+ * primary operational surface, and the server-side `/api/plugins/kanban/*`
+ * namespace it renders from is always mounted and enabled on the backend. It
+ * still inventories in Capabilities ▸ Plugins, so it can be switched off
+ * per-client from there.
  */
 
 import './kanban.css'
@@ -82,7 +85,7 @@ const plugin: HermesPlugin = {
   id: 'kanban',
   name: 'Kanban',
   description: 'Multi-agent task board — board page, sidebar entry, and a live in-flight count in the status bar.',
-  defaultEnabled: false,
+  defaultEnabled: true,
   register(ctx) {
     ctx.i18n.register(KANBAN_LOCALES)
     ctx.onDispose(bindApi(ctx.rest, ctx.storage, ctx.socket, { os: ctx.os, t: ctx.i18n.t }))

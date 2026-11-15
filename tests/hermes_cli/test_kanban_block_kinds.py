@@ -133,13 +133,13 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         assert kanban_cli._cmd_block(args) == 0
         assert "needs_input" in capsys.readouterr().out
         parked = kb.get_task(conn, child)
-        assert (parked.status, parked.block_kind, parked.block_recurrences) == ("blocked", "needs_input", 1)
+        assert (parked.status, parked.block_kind, parked.block_recurrences) == ("review", "needs_input", 1)
         events = kb.list_events(conn, child)
         assert not [e for e in events if e.kind == "dependency_wait"]
         blocked = [e for e in events if e.kind == "blocked"][-1].payload
         assert (blocked["requested_kind"], blocked["rekind_reason"]) == ("dependency", "no_open_parent")
         assert kb.recompute_ready(conn) == 0
-        assert kb.get_task(conn, child).status == "blocked"
+        assert kb.get_task(conn, child).status == "review"
 
         # A cron/human unblocks; the worker re-declares the same impossible wait.
         assert kb.unblock_task(conn, child)
