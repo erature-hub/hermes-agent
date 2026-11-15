@@ -242,6 +242,7 @@ _TICK_ACTIVITY_FIELDS = (
 
 def _fire_dispatch_tick_hook(
     result: DispatchResult, *, board: Optional[str] = None, dry_run: bool = False,
+    pacing_receipt: Optional[dict[str, Any]] = None,
 ) -> None:
     """``on_kanban_dispatch_tick`` — strictly AFTER ``_dispatch_tick_lock`` is
     released so a slow subscriber cannot stall a sibling dispatcher.
@@ -250,6 +251,11 @@ def _fire_dispatch_tick_hook(
     ``dispatch_once`` strictly AFTER ``_dispatch_tick_lock`` has been released — the original fired inside
     the lock, so a slow subscriber could extend the single-writer critical section and stall a sibling
     dispatcher's tick. Observer-only and fully best-effort: any subscriber failure is swallowed.
+
+    ``pacing_receipt`` is the JEV pacer's class (f) receipt for this tick, when
+    the pacer reported a stall episode. It is ENRICHMENT for the bus's own
+    class (f) event, never a second alarm: the bus keeps sole authority over
+    whether to page, against its own host-side ledger and dedupe window.
     """
     if not _kanban_observer_consumed("on_kanban_dispatch_tick"):
         return
@@ -270,6 +276,7 @@ def _fire_dispatch_tick_hook(
         invoke_hook(
             "on_kanban_dispatch_tick", board=board, profile_name=profile_name,
             dry_run=bool(dry_run), outcome=outcome, result=result,
+            pacing_receipt=pacing_receipt,
         )
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban dispatch tick hook failed: %s", exc)
