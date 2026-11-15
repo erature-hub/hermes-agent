@@ -106,7 +106,14 @@ def test_todo_card_held_for_a_human_is_not_promoted_when_parent_completes(
             expected_run_id=kb.get_task(conn, child_id).current_run_id,
         )
         parked = kb.get_task(conn, child_id)
-        assert parked.status == "blocked"
+        # The park lands in a lane ``recompute_ready`` does not scan. Which
+        # lane is POLICY (``blocked`` on main, ``review`` where a human gate
+        # is routed out of the promotable columns entirely) — both are parks,
+        # and neither is promoted.
+        assert parked.status in ("blocked", "review"), (
+            f"a {kind} park must land in a non-promotable lane, "
+            f"got {parked.status!r}"
+        )
         assert parked.block_kind == kind
 
         # The card now waits on the parent, and its status column drifts.
@@ -201,7 +208,7 @@ def test_explicit_unblock_releases_the_park(kanban_home: Path) -> None:
             expected_run_id=kb.get_task(conn, child_id).current_run_id,
         )
         kb.link_tasks(conn, parent_id, child_id)
-        assert kb.get_task(conn, child_id).status == "blocked"
+        assert kb.get_task(conn, child_id).status in ("blocked", "review")
 
         assert kb.unblock_task(conn, child_id)
         released = kb.get_task(conn, child_id)
