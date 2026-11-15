@@ -444,13 +444,6 @@ def execute(frame, channel):
             # exception is already propagating (so a raise here masks the real cause). Log it and
             # let the turn's own outcome stand (#t_8c013181).
             logger.warning('managed worker store.close() failed: %s', close_exc)
-        else:
-            if store.salvaged_rows:
-                # The owner never answered for these rows, so the outbox journalled them and a
-                # copy went to its salvage sink. The turn's own outcome stands: a lost ACK is
-                # not a lost turn (#t_5fd229d4).
-                logger.warning('managed worker salvaged %d unflushed transcript row(s) to %s',
-                               store.salvaged_rows, store.salvage_path)
         finally:
             with contextlib.suppress(Exception):  # a failing socket close never replaces the turn's outcome
                 rpc.close()
@@ -489,6 +482,8 @@ WORKER_FAILURE_CAUSES = frozenset({
     'unsupported_operation',
     # The owner's refusals that reach the worker over worker.persist.
     'admission_conflict', 'not_found', 'stale_epoch', 'stale_generation', 'unknown_execution',
+    # The HANDSHAKE faults: the owner could not be reached, or could not answer (#t_5fd229d4).
+    'worker_receipt_timeout', 'storage_unavailable',
 })
 
 

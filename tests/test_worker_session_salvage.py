@@ -14,7 +14,10 @@ lost.
 
 import asyncio
 from contextlib import asynccontextmanager
+import contextlib
 import json
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -79,6 +82,94 @@ def test_a_recovered_owner_leaves_no_salvage_behind(tmp_path):
         assert not store.salvage_path.exists()
     finally:
         store._outbox_owner.close()
+
+
+def test_a_worker_whose_owner_vanished_delivers_its_result_and_exits_cleanly(tmp_path, monkeypatch):
+    """The turn's work is done and its result is delivered: nothing books a crash.
+
+    This is the card's failure. The outbox latched the owner's refusal and the cleanup path
+    re-raised it, so a worker whose result had ALREADY been delivered exited 1 and the card
+    read ``managed_worker_failed`` for work that was done.
+    """
+    from agent import managed_worker as worker
+    from agent.runtime_session_store import RuntimeSessionStore
+    from tests.gateway.test_managed_turn_contract import assignment
+
+    def owner_gone(method, **params):
+        if method == 'worker.adopt':
+            return {'owner_epoch': 1}
+        if params.get('operation') == 'compression.history':
+            # The owner is there for the turn's history and gone by the time it is persisted:
+            # that is the shape of an owner that dies mid-turn.
+            return {'messages': [], 'count': 0, 'annotations': []}
+        raise WorkerPersistenceError('owner_unavailable')
+
+    stores = []
+
+    def capturing_store(*args, **kwargs):
+        store = RuntimeSessionStore(*args, **kwargs)
+        stores.append(store)
+        return store
+
+    class Agent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.session_prompt_tokens = 10
+            self.session_completion_tokens = 2
+
+        def run_conversation(self, text, **kwargs):
+            # The turn's own persistence is best-effort: the owner is gone, so the row stays
+            # journalled for the next execution that adopts this outbox.
+            with contextlib.suppress(Exception):
+                stores[0].append_messages_batch('sid', [{'role': 'assistant', 'content': 'done'}])
+            return {'final_response': 'the work is done', 'completed': True, 'partial': False,
+                    'turn_exit_reason': 'stop', 'prompt_tokens': 11, 'completion_tokens': 3,
+                    'estimated_cost_usd': .01, 'model': 'fixture', 'provider': 'custom',
+                    'messages': [{'role': 'assistant', 'content': 'done'}]}
+
+    class Controls:
+        def __init__(self, *args):
+            self.stopped = threading.Event()
+            self.finish = threading.Event()
+            self.finish.set()
+
+        def approval(self, data):
+            pytest.fail('unexpected approval')
+
+        def clarify(self, questions):
+            pytest.fail('unexpected question')
+
+    monkeypatch.setattr(worker, 'bind_worker_policy', lambda frame: None)
+    monkeypatch.setattr(worker, 'discover_profile_mcp', lambda policy: None)
+    monkeypatch.setattr(worker, 'retire_agent', lambda agent: None)
+    monkeypatch.setattr(worker, 'WorkerControls', Controls)
+    monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', lambda home: owner_gone)
+    monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', capturing_store)
+    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
+    monkeypatch.setattr('run_agent.AIAgent', Agent)
+    monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
+
+    frame, _ = assignment(tmp_path, monkeypatch)
+    frames = []
+    worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: frames.append({'type': kind, **payload})))
+
+    # The turn's result WAS delivered...
+    assert next(f for f in frames if f['type'] == 'result')['result']['final_response'] == 'the work is done'
+    # ...the worker reached 'finished', so the owner settles it as a completed turn...
+    assert any(f['type'] == 'finished' for f in frames)
+    # ...and no error frame booked a crash (that frame IS the exit code 1).
+    assert not [f for f in frames if f['type'] == 'error']
+    # The row the owner never took is salvaged, not lost.
+    assert stores[0].salvaged_rows == 1
+
+
+def test_the_card_names_the_handshake_fault_that_killed_the_turn():
+    """The card says WHICH refusal killed the turn: a handshake fault is a named cause."""
+    from agent.managed_worker import WORKER_FAILURE_CAUSES, _bounded_cause
+
+    assert _bounded_cause(WorkerPersistenceError('worker_receipt_timeout')) == 'worker_receipt_timeout'
+    assert _bounded_cause(WorkerPersistenceError('storage_unavailable')) == 'storage_unavailable'
+    assert 'worker_receipt_timeout' in WORKER_FAILURE_CAUSES
 
 
 # --------------------------------------------------------------------------------------
