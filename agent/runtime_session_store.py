@@ -16,6 +16,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,41 @@ class WorkerOutboxFull(WorkerPersistenceError):
     ``close()`` re-raised it past the point where the result had already been produced
     (#t_8c013181).
     """
+
+
+#: The persistence HANDSHAKE is the worker's authenticated call to its owner: dialling it,
+#: sending the request, and receiving the answer. These are that handshake's refusal codes --
+#: the owner could not be reached, it could not answer, or it no longer holds the binding this
+#: worker adopted. They say nothing about the payload's validity and nothing about the journal's
+#: durability: a write is journalled BEFORE it is offered, so the pending entry is on disk and
+#: the next execution that adopts this outbox replays it. A latched handshake fault therefore
+#: must not fail the worker at close (#t_5fd229d4).
+PERSISTENCE_HANDSHAKE_FAULTS = frozenset({
+    'owner_unavailable',
+    'synchronous_self_rpc',
+    'synchronous_rpc_on_event_loop',
+    'worker_receipt_timeout',
+    'admission_conflict',
+    'not_found',
+    'stale_epoch',
+    'stale_generation',
+    'unknown_execution',
+    'storage_unavailable',
+})
+
+
+def is_persistence_handshake_fault(exc):
+    """True when *exc* is a fault of the persistence HANDSHAKE.
+
+    The owner's transport failures carry no refusal code of their own (a closed socket, a receipt
+    that never came), so they are recognised by their type; the owner's own refusals carry theirs.
+    A disk fault is neither: the journal is what the handshake could not deliver, and a disk that
+    refused the write is not salvageable.
+    """
+    from websockets.exceptions import ConnectionClosed
+    if isinstance(exc, (TimeoutError, ConnectionError, ConnectionClosed)):
+        return True
+    return str(exc) in PERSISTENCE_HANDSHAKE_FAULTS
 
 
 def _caller_summary(limit=8):
@@ -256,6 +292,12 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self.max_bytes = max_bytes
         self.lock = threading.RLock()
         self.failure = None
+        # Whether the latched failure is a persistence-HANDSHAKE fault (the owner could not be
+        # reached or could not answer) rather than a payload or disk fault. Only a handshake
+        # fault is salvageable at close.
+        self.failure_handshake = False
+        # The transcript rows a salvaged close could not hand the owner.
+        self.salvaged_rows = 0
         self.path = Path(outbox_dir) / 'pending.json'
         make_user_dir(self.path.parent, mode=0o700, parents=True, exist_ok=True)
         if self.path.parent.is_symlink() or self.path.is_symlink():
@@ -370,6 +412,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 raise
             except Exception as exc:
                 self.failure = str(exc)
+                self.failure_handshake = is_persistence_handshake_fault(exc)
                 raise
             prior = self.journal
             self.journal = candidate
@@ -387,6 +430,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     self._save(prior, ceiling=OUTBOX_RELOAD_CEILING)  # scope-only rewrite, never new payload
                     self.journal = prior
                     self.failure = None
+                    self.failure_handshake = False
                 raise
 
     def retry_pending(self):
@@ -407,8 +451,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     results.append(result)
             except Exception as exc:
                 self.failure = str(exc)
+                self.failure_handshake = is_persistence_handshake_fault(exc)
                 raise
             self.failure = None
+            self.failure_handshake = False
             return results
 
     def adopt(self, epoch):
@@ -419,6 +465,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self.scope = candidate['scope']
             self.journal = candidate
             self.failure = None
+            self.failure_handshake = False
 
     def append_messages_batch(self, session_id, messages, compression_lock_holder=None,
                               turn_lease_holder=None, chunk_rows=None, turn_lease_ttl_seconds=300.0):
@@ -552,8 +599,100 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         return self._apply('execution.finish', {})
 
     def close(self):
+        """Release the outbox. A latched persistence-HANDSHAKE fault does not fail the worker.
+
+        A handshake fault says the owner could not be reached or could not answer; it says
+        nothing about the payload and nothing about the journal, which holds the pending entry
+        on disk for the next execution that adopts this outbox. Re-raising such a fault here
+        lost FINISHED turns: the result had already been delivered, and the raise turned it into
+        a ``managed_worker_failed`` card and an exit code 1 on work that was done (#t_5fd229d4).
+        """
         with self.lock:
             try:
                 self.flush_token_counts()
+            except WorkerPersistenceError as exc:
+                if not self._salvage_handshake_fault(exc):
+                    raise
             finally:
                 self._outbox_owner.close()
+
+    def _salvage_handshake_fault(self, exc):
+        """Salvage the unflushed transcript rows; False when the caller must re-raise.
+
+        Only a HANDSHAKE fault over a durably flushed journal is salvageable: the journal on
+        disk is the durable record, so the salvage is the second copy that names the rows a
+        recovery tool has to replay.
+        """
+        if not self.failure_handshake:
+            return False
+        if not self._journal_is_durable():
+            logger.error('worker outbox %s holds a latched persistence fault (%s) but its journal '
+                         'is not durably flushed; there is nothing to salvage', self.path, exc)
+            return False
+        rows = self._salvage_rows()
+        try:
+            path = self._write_salvage(rows)
+        except OSError as write_exc:
+            # The journal still holds the rows, so a refused salvage is a lost COPY, not a lost
+            # turn: log it and close cleanly.
+            logger.error('worker outbox %s could not write its salvage sink (%s); its journal still '
+                         'holds %d row(s)', self.path, write_exc, len(rows))
+            path = None
+        self.salvaged_rows = len(rows)
+        logger.warning('worker outbox %s closed with a latched persistence-handshake fault (%s); '
+                       '%d unflushed transcript row(s) salvaged to %s', self.path, exc, len(rows), path)
+        return True
+
+    def _journal_is_durable(self):
+        """True when the journal on disk still holds this store's pending entries.
+
+        A write is journalled BEFORE it is offered to the owner, so a handshake fault leaves the
+        pending entry on disk and the next execution that adopts this outbox replays it. A fault
+        before the write leaves the disk behind this store's memory, and there is nothing to
+        salvage.
+        """
+        try:
+            disk = json.loads(self.path.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            return False
+        return disk.get('pending') == self.journal['pending']
+
+    def _salvage_rows(self):
+        """The transcript rows this store could not hand the owner.
+
+        Only TRANSCRIPT rows are salvaged: they are the work itself. A pending entry that carries
+        no messages (a lease renewal, a usage count) has nothing to salvage.
+        """
+        rows = []
+        for entry in self.journal['pending']:
+            payload = entry.get('payload') if isinstance(entry, dict) else None
+            messages = payload.get('messages') if isinstance(payload, dict) else None
+            if not isinstance(messages, list):
+                continue
+            for message in messages:
+                rows.append({'sequence': entry.get('sequence'), 'operation': entry.get('operation'),
+                             'session_id': self.scope.get('session_id'), 'message': message})
+        return rows
+
+    @property
+    def salvage_path(self):
+        """This outbox's scratch sink: the transcript rows a salvaged close could not deliver."""
+        return self.path.parent / 'salvage.jsonl'
+
+    def _write_salvage(self, rows):
+        """Append the salvaged rows to this outbox's scratch sink.
+
+        The sink is a file BESIDE the journal, never the journal itself: the next execution that
+        adopts this outbox rewrites the journal, and the salvage has to outlive that.
+        """
+        path = self.salvage_path
+        header = {'salvaged_at': time.time(), 'failure': self.failure, 'rows': len(rows),
+                  'scope': dict(self.scope)}
+        with path.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps(header, ensure_ascii=True, default=str) + '\n')
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=True, default=str) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o600)
+        return path
