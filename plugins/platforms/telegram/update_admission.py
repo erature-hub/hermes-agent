@@ -219,16 +219,23 @@ class PerChatUpdateProcessor(SimpleUpdateProcessor):
                 prev.add_done_callback(release)
 
 
-def build_update_processor(adapter) -> PerChatUpdateProcessor:
+def build_update_processor(adapter, name: str | None = None) -> PerChatUpdateProcessor:
     """``platforms.telegram.extra.max_concurrent_updates`` (default 32); bad values warn and fall back."""
-    name = adapter.name
-    raw = adapter.config.extra.get("max_concurrent_updates", DEFAULT_MAX_CONCURRENT_UPDATES)
+    if name is not None and isinstance(adapter, dict):
+        # Legacy 2-arg call: build_update_processor(extra_dict, adapter_name)
+        extra = adapter
+        adopt = None
+    else:
+        name = adapter.name
+        extra = adapter.config.extra
+        adopt = getattr(adapter, "_admit_topic_follow", None)
+    raw = extra.get("max_concurrent_updates", DEFAULT_MAX_CONCURRENT_UPDATES)
     limit = coerce_port(raw, 0)
     if limit < 1:
         logger.warning("[%s] Invalid max_concurrent_updates=%r; using %d",
                        name, raw, DEFAULT_MAX_CONCURRENT_UPDATES)
         limit = DEFAULT_MAX_CONCURRENT_UPDATES
-    return PerChatUpdateProcessor(limit, adopt=adapter._admit_topic_follow)
+    return PerChatUpdateProcessor(limit, adopt=adopt)
 
 
 class TelegramApplication(Application):
