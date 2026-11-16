@@ -28,8 +28,11 @@ def test_outbox_freezes_failed_payload_and_reopens_exclusively(tmp_path):
         with pytest.raises(WorkerPersistenceError, match='offline'):
             store.queue_token_counts('s', input_tokens=1)
     finally:
-        with pytest.raises(WorkerPersistenceError, match='offline'):
-            store.close()
+        # The owner timed out: a persistence-HANDSHAKE fault. The payload is frozen on disk
+        # and the journal is durable, so the close salvages the rows and returns cleanly
+        # instead of failing a turn whose work was already done (#t_5fd229d4).
+        store.close()
+        assert store.salvaged_rows == 1
     seen = []
     def commit(method, **params):
         seen.append(params)

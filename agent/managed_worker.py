@@ -483,6 +483,8 @@ WORKER_FAILURE_CAUSES = frozenset({
     'unsupported_operation',
     # The owner's refusals that reach the worker over worker.persist.
     'admission_conflict', 'not_found', 'stale_epoch', 'stale_generation', 'unknown_execution',
+    # The HANDSHAKE faults: the owner could not be reached, or could not answer (#t_5fd229d4).
+    'worker_receipt_timeout', 'storage_unavailable',
 })
 
 

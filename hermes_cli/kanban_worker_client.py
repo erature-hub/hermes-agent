@@ -34,6 +34,12 @@ _RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_contro
                                       'invalid_control_response'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
+#: How many times a worker re-admits its claim after an ``unknown`` receipt before it declares the
+#: attempt terminally lost. ``kanban.run`` is idempotent per attempt, so a repeat either answers
+#: with that attempt's receipt (it had settled after all) or admits that attempt again (it had
+#: not). The bound keeps a worker alive on an owner that keeps answering ``unknown`` no longer
+#: than the card's own failure budget deserves.
+READMISSION_ATTEMPTS = 2
 
 
 def admission_answer_budget():
@@ -120,23 +126,53 @@ async def _discard(events):
 
 async def _await_receipt(client, params, board_db, claim):
     """Submit the claim (or, on a later connection, re-read the admission it got) and return its
-    settled receipt, recording each owner answer on *claim*."""
+    settled receipt, recording each owner answer on *claim*.
+
+    An ``unknown`` receipt is not a settled attempt: it is the owner's epoch moving under a
+    started turn (the owner restarted, or its epoch was bumped), so the attempt's outcome is not
+    in the receipt. The ATTEMPT is not lost -- ``kanban.run`` is idempotent per attempt -- so the
+    worker re-admits the SAME claim (its existing run_id and board context), bounded, before it
+    declares the attempt terminally lost (#t_5fd229d4).
+    """
     if claim.admission_id is None:
-        db = str(await asyncio.to_thread(Path(board_db).resolve))
-        # The owner answers only after it checks the claim and writes its ``owner_admitted`` marker
-        # in one board write transaction. The board (the cross-profile dispatch bus) can make that
-        # wait out its busy timeout, so the 30 s default left the owner admitting an attempt whose
-        # submitter had exited (the later-bound worker's submitter-liveness watcher ended it, and the
-        # admission was left ``unknown``). The wait is still finite: once the marker commits,
-        # ``enforce_max_runtime`` and TTL reclaim skip the run (``owner_reclaim_paused``), so an owner
-        # that stalls after admitting is bounded by this wait and ``OWNER_WAIT_S``.
-        accepted = await client.rpc('kanban.run', _timeout=admission_answer_budget(), **dict(params, db=db))
-        receipt = accepted['receipt']
-        claim.session_id, claim.admission_id = accepted['session_id'], receipt['admission_id']
-        print(f'Session: {claim.session_id}', file=sys.stderr)
+        receipt = await _run_claim(client, params, board_db, claim)
     else:
         receipt = await _receipt(client, claim)
     claim.answered = time.monotonic()
+    receipt = await _settle(client, claim, receipt)
+    for _ in range(READMISSION_ATTEMPTS):
+        if receipt['status'] != 'unknown':
+            break
+        receipt = await _settle(client, claim, await _run_claim(client, params, board_db, claim))
+    return receipt
+
+
+async def _run_claim(client, params, board_db, claim):
+    """Ask the owner to admit this claim; its answer names the session and the admission.
+
+    ``kanban.run`` is idempotent per attempt, so this same call IS the re-admission of an attempt
+    whose receipt came back ``unknown``: it answers with that attempt's receipt when the attempt
+    had settled after all, and admits that attempt again when it had not. The claim's own run_id
+    and board context ride along, so a re-admission is that attempt and not a new one.
+    """
+    db = str(await asyncio.to_thread(Path(board_db).resolve))
+    # The owner answers only after it checks the claim and writes its ``owner_admitted`` marker
+    # in one board write transaction. The board (the cross-profile dispatch bus) can make that
+    # wait out its busy timeout, so the 30 s default left the owner admitting an attempt whose
+    # submitter had exited (the later-bound worker's submitter-liveness watcher ended it, and the
+    # admission was left ``unknown``). The wait is still finite: once the marker commits,
+    # ``enforce_max_runtime`` and TTL reclaim skip the run (``owner_reclaim_paused``), so an owner
+    # that stalls after admitting is bounded by this wait and ``OWNER_WAIT_S``.
+    accepted = await client.rpc('kanban.run', _timeout=admission_answer_budget(), **dict(params, db=db))
+    receipt = accepted['receipt']
+    claim.session_id, claim.admission_id = accepted['session_id'], receipt['admission_id']
+    claim.answered = time.monotonic()
+    print(f'Session: {claim.session_id}', file=sys.stderr)
+    return receipt
+
+
+async def _settle(client, claim, receipt):
+    """Wait for a receipt to settle: a terminal answer, or an ``unknown`` one."""
     while receipt['status'] not in {'terminal', 'unknown'}:
         await asyncio.sleep(.2)
         receipt = await _receipt(client, claim)
