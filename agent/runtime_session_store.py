@@ -16,9 +16,22 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
+
+# The per-write journal ceiling. A worker's outbox carries at most one pending entry (``_apply``
+# refuses while another is outstanding), so this bounds a single payload, not the accumulated file.
+# 4MiB was below the real cost of the writes that flow through it: a compaction commit ships the
+# message list twice (``messages`` plus the ``held_for_cas`` projection the owner's CAS fence
+# reads), and the refused writes measured on this host ran 4.05MiB to 11.02MiB (worst observed
+# 11.02MiB, over 49 refusals). 16MiB keeps ~1.5x headroom over that worst case.
+DEFAULT_OUTBOX_MAX_BYTES = 16 * 1024 * 1024
+# Reload is deliberately NOT bounded by the write ceiling: a journal larger than what this version
+# would write is exactly the state a stuck execution has to be able to open and drain. It is bounded
+# only by a hard memory ceiling, so a corrupt/hostile file cannot be read unbounded.
+OUTBOX_RELOAD_CEILING = 64 * 1024 * 1024
 
 _worker_process = False
 
@@ -45,6 +58,55 @@ def apply_row_annotations(messages, annotations):
 
 class WorkerPersistenceError(RuntimeError):
     pass
+
+
+class WorkerOutboxFull(WorkerPersistenceError):
+    """A payload the journal cannot hold, refused *before* anything is written.
+
+    Never latches ``RuntimeSessionStore.failure``. A capacity refusal is a statement about the
+    caller's payload, not about the store's health: the journal on disk is untouched, nothing is
+    outstanding, and the next attempt -- a smaller payload, a chunked append, or a fresh worker
+    execution -- can succeed. Latching it instead turned one oversized transcript prune into a
+    lost turn and a ``managed_worker_failed`` card: the latched error then failed
+    ``refresh_session_turn_lease``, the lease-loss guard hard-interrupted the agent mid-stream, and
+    ``close()`` re-raised it past the point where the result had already been produced
+    (#t_8c013181).
+    """
+
+
+#: The persistence HANDSHAKE is the worker's authenticated call to its owner: dialling it,
+#: sending the request, and receiving the answer. These are that handshake's refusal codes --
+#: the owner could not be reached, it could not answer, or it no longer holds the binding this
+#: worker adopted. They say nothing about the payload's validity and nothing about the journal's
+#: durability: a write is journalled BEFORE it is offered, so the pending entry is on disk and
+#: the next execution that adopts this outbox replays it. A latched handshake fault therefore
+#: must not fail the worker at close (#t_5fd229d4).
+PERSISTENCE_HANDSHAKE_FAULTS = frozenset({
+    'owner_unavailable',
+    'synchronous_self_rpc',
+    'synchronous_rpc_on_event_loop',
+    'worker_receipt_timeout',
+    'admission_conflict',
+    'not_found',
+    'stale_epoch',
+    'stale_generation',
+    'unknown_execution',
+    'storage_unavailable',
+})
+
+
+def is_persistence_handshake_fault(exc):
+    """True when *exc* is a fault of the persistence HANDSHAKE.
+
+    The owner's transport failures carry no refusal code of their own (a closed socket, a receipt
+    that never came), so they are recognised by their type; the owner's own refusals carry theirs.
+    A disk fault is neither: the journal is what the handshake could not deliver, and a disk that
+    refused the write is not salvageable.
+    """
+    from websockets.exceptions import ConnectionClosed
+    if isinstance(exc, (TimeoutError, ConnectionError, ConnectionClosed)):
+        return True
+    return str(exc) in PERSISTENCE_HANDSHAKE_FAULTS
 
 
 def _caller_summary(limit=8):
@@ -156,7 +218,7 @@ class WorkerRPC:
         # No library keepalive: its pong deadline would run independently of (and could fail) a call
         # inside its receipt budget; that budget and the observed close are the liveness checks.
         self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=5, close_timeout=1,
-                                       max_size=8 * 1024 * 1024, proxy=None, ping_interval=None))
+                                       max_size=OUTBOX_RELOAD_CEILING, proxy=None, ping_interval=None))
         return self.link
 
     def _drop(self):
@@ -216,19 +278,26 @@ from agent.runtime_session_lifecycle import RuntimeSessionLifecycleMixin
 class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycleMixin):
     """Synchronous durable results with a private byte-bounded retry journal.
 
-    A failed write remains pending, and failure is sticky until explicit retry or
-    adoption. Local queue acceptance is never returned as canonical commit.
-    Pending journals live outside age-pruned cache trees.
+    A failed write remains pending, and a *durability* failure is sticky until explicit retry or
+    adoption. A *capacity* refusal (``WorkerOutboxFull``) is not: it is decided before any write and
+    never latches, so the same store can carry the next, smaller write. Local queue acceptance is
+    never returned as canonical commit. Pending journals live outside age-pruned cache trees.
     """
     # The process's async-delegation ledger belongs to the adopted execution, never a reserved child.
     binds_delegation_ledger = True
 
-    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
+    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=DEFAULT_OUTBOX_MAX_BYTES):
         self.rpc = rpc
         self.scope = dict(scope)
         self.max_bytes = max_bytes
         self.lock = threading.RLock()
         self.failure = None
+        # Whether the latched failure is a persistence-HANDSHAKE fault (the owner could not be
+        # reached or could not answer) rather than a payload or disk fault. Only a handshake
+        # fault is salvageable at close.
+        self.failure_handshake = False
+        # The transcript rows a salvaged close could not hand the owner.
+        self.salvaged_rows = 0
         self.path = Path(outbox_dir) / 'pending.json'
         make_user_dir(self.path.parent, mode=0o700, parents=True, exist_ok=True)
         if self.path.parent.is_symlink() or self.path.is_symlink():
@@ -245,8 +314,17 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             raise WorkerPersistenceError('outbox_in_use')
         try:
             if self.path.exists():
-                if self.path.stat().st_size > max_bytes:
-                    raise WorkerPersistenceError('outbox_full')
+                size = self.path.stat().st_size
+                if size > OUTBOX_RELOAD_CEILING:
+                    raise WorkerPersistenceError('outbox_oversized')
+                if size > max_bytes:
+                    # Opening must not be gated on the write ceiling: an execution whose own journal
+                    # is already this large has to be able to replay it and shrink it, otherwise the
+                    # outbox bricks every subsequent attempt at that execution_id with no way out
+                    # but deleting the directory by hand.
+                    logger.warning('outbox journal %s is %.1fMiB, above the %.1fMiB write ceiling; '
+                                   'opening it to drain rather than refusing the execution',
+                                   self.path, size / 1048576, max_bytes / 1048576)
                 self.journal = json.loads(self.path.read_text(encoding="utf-8-sig"))
                 reconciled = self.journal['scope'] != self.scope
                 if reconciled:
@@ -293,17 +371,19 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     entry['operation'] == 'compression.publish' for entry in self.journal['pending']))):
             raise WorkerPersistenceError('outbox_scope_mismatch')
         candidate = dict(self.journal, scope=dict(old, epoch=new['epoch']))
-        self._save(candidate)
+        self._save(candidate, ceiling=OUTBOX_RELOAD_CEILING)  # scope-only rewrite, never new payload
         self.scope = candidate['scope']
         self.journal = candidate
 
-    def _save(self, journal):
+    def _save(self, journal, *, ceiling=None):
         if self._outbox_owner.closed:
             raise WorkerPersistenceError('outbox_closed')
         encoded = json.dumps(journal, ensure_ascii=True, allow_nan=False, separators=(',', ':')).encode()
-        if len(encoded) > self.max_bytes:
-            self.failure = 'outbox_full'
-            raise WorkerPersistenceError(self.failure)
+        limit = self.max_bytes if ceiling is None else ceiling
+        if len(encoded) > limit:
+            # Refused before the file is touched: nothing is pending, nothing on disk changed, and
+            # nothing here is unsafe to forget. Latching this was the defect that cost whole turns.
+            raise WorkerOutboxFull('outbox_full')
         from utils import atomic_write_bytes
         # Owner-only journal (the dir is 0700 too); the rename and its directory entry are durable.
         atomic_write_bytes(self.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)
@@ -324,11 +404,34 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             candidate['next_sequence'] += 1
             try:
                 self._save(candidate)
+            except WorkerOutboxFull:
+                # Capacity refusal decided before any write: the journal on disk still matches
+                # ``self.journal`` and nothing is outstanding, so the next attempt is free to be a
+                # smaller payload. Latching here would poison every later call on this store --
+                # including the liveness-critical ``refresh_session_turn_lease``.
+                raise
             except Exception as exc:
                 self.failure = str(exc)
+                self.failure_handshake = is_persistence_handshake_fault(exc)
                 raise
+            prior = self.journal
             self.journal = candidate
-            return self.retry_pending()[0]
+            try:
+                return self.retry_pending()[0]
+            except WorkerPersistenceError as exc:
+                if str(exc) == 'invalid_params':
+                    # A pre-commit refusal by the owner: no receipt was written and the owner's
+                    # ``last_sequence`` is unchanged, so this entry can never land as written.
+                    # Roll it back and clear the latch: a refusal of ONE payload is not a statement
+                    # about the store's health, and latching it failed
+                    # ``refresh_session_turn_lease`` (which hard-interrupted the agent mid-stream)
+                    # and then re-raised out of ``close()`` -- turning a completed turn into a
+                    # lost one and a ``managed_worker_failed`` card (#t_8c013181).
+                    self._save(prior, ceiling=OUTBOX_RELOAD_CEILING)  # scope-only rewrite, never new payload
+                    self.journal = prior
+                    self.failure = None
+                    self.failure_handshake = False
+                raise
 
     def retry_pending(self):
         with self.lock:
@@ -339,24 +442,30 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     result = self.rpc('worker.persist', **self.scope, **entry)
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
-                    self._save(candidate)
+                    # A drain only ever shrinks the journal, so it is bounded by the reload ceiling
+                    # and not the write ceiling: otherwise a journal this execution already owns and
+                    # is trying to empty would refuse to be emptied, and stay stuck forever.
+                    self._save(candidate, ceiling=OUTBOX_RELOAD_CEILING)
                     self.scope = candidate['scope']
                     self.journal = candidate
                     results.append(result)
             except Exception as exc:
                 self.failure = str(exc)
+                self.failure_handshake = is_persistence_handshake_fault(exc)
                 raise
             self.failure = None
+            self.failure_handshake = False
             return results
 
     def adopt(self, epoch):
         """Install only a separately verified worker.adopt result; never self-adopt."""
         with self.lock:
             candidate = dict(self.journal, scope=dict(self.scope, epoch=epoch))
-            self._save(candidate)
+            self._save(candidate, ceiling=OUTBOX_RELOAD_CEILING)  # scope-only rewrite, never new payload
             self.scope = candidate['scope']
             self.journal = candidate
             self.failure = None
+            self.failure_handshake = False
 
     def append_messages_batch(self, session_id, messages, compression_lock_holder=None,
                               turn_lease_holder=None, chunk_rows=None, turn_lease_ttl_seconds=300.0):
@@ -490,8 +599,100 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         return self._apply('execution.finish', {})
 
     def close(self):
+        """Release the outbox. A latched persistence-HANDSHAKE fault does not fail the worker.
+
+        A handshake fault says the owner could not be reached or could not answer; it says
+        nothing about the payload and nothing about the journal, which holds the pending entry
+        on disk for the next execution that adopts this outbox. Re-raising such a fault here
+        lost FINISHED turns: the result had already been delivered, and the raise turned it into
+        a ``managed_worker_failed`` card and an exit code 1 on work that was done (#t_5fd229d4).
+        """
         with self.lock:
             try:
                 self.flush_token_counts()
+            except WorkerPersistenceError as exc:
+                if not self._salvage_handshake_fault(exc):
+                    raise
             finally:
                 self._outbox_owner.close()
+
+    def _salvage_handshake_fault(self, exc):
+        """Salvage the unflushed transcript rows; False when the caller must re-raise.
+
+        Only a HANDSHAKE fault over a durably flushed journal is salvageable: the journal on
+        disk is the durable record, so the salvage is the second copy that names the rows a
+        recovery tool has to replay.
+        """
+        if not self.failure_handshake:
+            return False
+        if not self._journal_is_durable():
+            logger.error('worker outbox %s holds a latched persistence fault (%s) but its journal '
+                         'is not durably flushed; there is nothing to salvage', self.path, exc)
+            return False
+        rows = self._salvage_rows()
+        try:
+            path = self._write_salvage(rows)
+        except OSError as write_exc:
+            # The journal still holds the rows, so a refused salvage is a lost COPY, not a lost
+            # turn: log it and close cleanly.
+            logger.error('worker outbox %s could not write its salvage sink (%s); its journal still '
+                         'holds %d row(s)', self.path, write_exc, len(rows))
+            path = None
+        self.salvaged_rows = len(rows)
+        logger.warning('worker outbox %s closed with a latched persistence-handshake fault (%s); '
+                       '%d unflushed transcript row(s) salvaged to %s', self.path, exc, len(rows), path)
+        return True
+
+    def _journal_is_durable(self):
+        """True when the journal on disk still holds this store's pending entries.
+
+        A write is journalled BEFORE it is offered to the owner, so a handshake fault leaves the
+        pending entry on disk and the next execution that adopts this outbox replays it. A fault
+        before the write leaves the disk behind this store's memory, and there is nothing to
+        salvage.
+        """
+        try:
+            disk = json.loads(self.path.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            return False
+        return disk.get('pending') == self.journal['pending']
+
+    def _salvage_rows(self):
+        """The transcript rows this store could not hand the owner.
+
+        Only TRANSCRIPT rows are salvaged: they are the work itself. A pending entry that carries
+        no messages (a lease renewal, a usage count) has nothing to salvage.
+        """
+        rows = []
+        for entry in self.journal['pending']:
+            payload = entry.get('payload') if isinstance(entry, dict) else None
+            messages = payload.get('messages') if isinstance(payload, dict) else None
+            if not isinstance(messages, list):
+                continue
+            for message in messages:
+                rows.append({'sequence': entry.get('sequence'), 'operation': entry.get('operation'),
+                             'session_id': self.scope.get('session_id'), 'message': message})
+        return rows
+
+    @property
+    def salvage_path(self):
+        """This outbox's scratch sink: the transcript rows a salvaged close could not deliver."""
+        return self.path.parent / 'salvage.jsonl'
+
+    def _write_salvage(self, rows):
+        """Append the salvaged rows to this outbox's scratch sink.
+
+        The sink is a file BESIDE the journal, never the journal itself: the next execution that
+        adopts this outbox rewrites the journal, and the salvage has to outlive that.
+        """
+        path = self.salvage_path
+        header = {'salvaged_at': time.time(), 'failure': self.failure, 'rows': len(rows),
+                  'scope': dict(self.scope)}
+        with path.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps(header, ensure_ascii=True, default=str) + '\n')
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=True, default=str) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o600)
+        return path

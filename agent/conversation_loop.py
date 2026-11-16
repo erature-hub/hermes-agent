@@ -35,7 +35,11 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
-from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
+from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON, PreflightCompressionTimedOut, build_turn_context
+from agent.turn_nudges import (
+    _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX, _LENGTH_CONTINUATION_NETWORK_STUB,
+    _LENGTH_CONTINUATION_OUTPUT_LIMIT,
+)
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from hermes_cli.plugins_dispatch import held_stream_transforms
 from agent.turn_retry_state import TurnRetryState
@@ -984,27 +988,6 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     return True
 
 
-# Named so _is_synthetic_compression_user_turn can recognize a crash-persisted nudge by
-# content (SessionDB projection strips the _length_continuation_nudge tag).
-_LENGTH_CONTINUATION_NETWORK_STUB = (
-    "[System: The previous response was cut off by a network error mid-stream — a transport "
-    "interruption, NOT a change in your capabilities. Your tools are still fully available; call "
-    "them as normal and ignore any earlier claim that you lack tool access. Continue the task "
-    "from where you left off. Do not restart or repeat prior text.]"
-)
-_LENGTH_CONTINUATION_OUTPUT_LIMIT = (
-    "[System: Your previous response was truncated by the output length limit. Continue exactly "
-    "where you left off. Do not restart or repeat prior text. Finish the answer directly.]"
-)
-# Pre-#74990 wording; kept so crash-persisted nudges from older sessions are still recognized.
-_LEGACY_LENGTH_CONTINUATION_NETWORK_STUB = (
-    "[System: The previous response was cut off by a network error mid-stream. Continue exactly "
-    "where you left off. Do not restart or repeat prior text. Finish the answer directly.]"
-)
-# The dropped-tools variant interpolates tool names; matched by prefix.
-_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
-
-
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[list[str]] = None) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
@@ -1017,45 +1000,6 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[list
             "interruption, not a capability change — your tools remain fully available.]"
         )
     return _LENGTH_CONTINUATION_NETWORK_STUB if is_partial_stub else _LENGTH_CONTINUATION_OUTPUT_LIMIT
-
-
-# Codex/Responses turns that returned only internal reasoning: a bare retry would be
-# byte-identical, so the model repeats it.
-_CODEX_INCOMPLETE_NUDGE = (
-    "[System: Your previous response contained only internal reasoning and never produced a "
-    "visible answer or tool call. Do not keep thinking. Produce your final answer as plain text "
-    "now (or make the tool call you were planning).]"
-)
-
-
-# Re-prompt after an acknowledgment-only Codex/Responses reply.
-_CODEX_ACK_CONTINUATION_NUDGE = (
-    "[System: Continue now. Execute the required tool calls and only send your final answer "
-    "after completing the task.]"
-)
-
-# Re-prompt after a collapsed fragment ended a turn that had done real tool work (#103483). Asks
-# for the same answer again when it WAS complete, so a false positive costs one call, never the answer.
-_DEGENERATE_FINAL_NUDGE = (
-    "[System: Your previous message ended the turn with a fragment that is not a usable answer. "
-    "If the task is unfinished, continue it and then give the complete answer. If that fragment "
-    "WAS your complete answer, send it again exactly as before.]"
-)
-
-# Re-prompt for finish_reason="tool_calls" with empty tool_calls (an interrupt mid-retry can persist it).
-_DROPPED_TOOLCALL_NUDGE_CONTENT = (
-    "Your previous turn indicated a tool call but none was included. Do not narrate a plan or "
-    "restate intent — issue the actual tool call now to continue the task."
-)
-
-# Re-prompt for an empty response after tool calls (#9400); the metadata flag does not
-# survive SessionDB projection, so it is matched by content.
-_EMPTY_TOOL_RESPONSE_NUDGE = (
-    "You just executed tool calls but returned an empty response. Please process the tool "
-    "results above and continue with the task."
-)
-
-
 
 
 # Memo for send-path tool-call argument canonicalization (re-run on every historical call
@@ -1138,15 +1082,21 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
 
 
 def _content_policy_blocked_result(
-    messages: list[dict], api_call_count: int, *, final_response: str, error_detail: str
+    messages: list[dict], api_call_count: int, *, final_response: str, error_detail: str,
+    boundary_row_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Terminal turn result for a content-policy block (deterministic for the unchanged
-    prompt, so no retry); shared by the HTTP-200 and exception paths."""
-    return {
+    prompt, so no retry); shared by the HTTP-200 and exception paths. ``messages`` is the
+    CLEAN pre-refusal history (the refused turn is dropped from it). ``boundary_row_id`` is
+    the durable row that started the refused run, so the owner drops the exact turn."""
+    result = {
         "final_response": final_response, "messages": messages, "api_calls": api_call_count,
         "completed": False, "failed": True, "error": f"content_policy_blocked: {error_detail}",
         "failure_reason": "content_policy_blocked", "failure_retryable": False,
     }
+    if boundary_row_id is not None:
+        result["refused_turn_boundary_row_id"] = boundary_row_id
+    return result
 
 
 def _partial_turn_result(
@@ -1600,6 +1550,25 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
     return None
 
 
+def _finalize_from_state(agent: Any, s: _LoopState) -> dict[str, Any]:
+    """Post-loop finalization (agent/turn_finalizer.finalize_turn) fed from the loop state."""
+    return finalize_turn(agent, **{
+        name: getattr(s, name)
+        for name in inspect.signature(finalize_turn).parameters if name != "agent"
+    })
+
+
+def _turn_without_loop(agent: Any, s: _LoopState, block_message: str) -> Optional[dict[str, Any]]:
+    """The turn's result when it never enters the generic loop, else None. A ``pre_llm_call``
+    veto finalizes with no inference request (the block message closes the transcript pair);
+    the opt-in codex app-server runtime runs the whole turn in its subprocess
+    (agent/transports/codex_app_server_session.py)."""
+    if block_message:
+        s.final_response, s._turn_exit_reason = block_message, PRE_LLM_BLOCK_EXIT_REASON
+        return _finalize_from_state(agent, s)
+    return _codex_app_server_turn(agent, s) if agent.api_mode == "codex_app_server" else None
+
+
 def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     """The codex app-server's result for this turn, or None when its failure activated a fallback and the
     generic loop retries the same user turn."""
@@ -1717,10 +1686,8 @@ def _run_conversation_turn(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
-    # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
-    # app-server subprocess (see agent/transports/codex_app_server_session.py).
-    if agent.api_mode == "codex_app_server" and (codex_result := _codex_app_server_turn(agent, s)) is not None:
-        return codex_result
+    if (early_result := _turn_without_loop(agent, s, _ctx.plugin_block_message)) is not None:
+        return early_result
 
     _prelude_action, _prelude_result = play_prelude(agent, s, prelude)
     if _prelude_action == "return":
@@ -1774,11 +1741,7 @@ def _run_conversation_turn(
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
                 break
 
-    # Post-loop finalization lives in agent/turn_finalizer.finalize_turn.
-    result = finalize_turn(agent, **{
-        name: getattr(s, name)
-        for name in inspect.signature(finalize_turn).parameters if name != "agent"
-    })
+    result = _finalize_from_state(agent, s)
     if s._compression_timeout_exhausted:
         # Reuse the gateway's context-recovery contract: transcript stays intact while
         # future input can move to a clean session (#98722).
@@ -1906,16 +1869,22 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
 
     Excluded: the context-pressure classes (``compression_exhausted``, ``compression_deferred``,
     ``failure_reason == "context_overflow"``) — appending to an already-oversized session is the
-    #1630 growth loop; their repair is rotation or a retry. Idempotence is keyed on the DURABLE
-    tail (``SessionDB.latest_conversation_role``), so a redelivery or a tail already closed by
-    another writer is a no-op, and the gateway's own closer then no-ops in turn.
+    #1630 growth loop; their repair is rotation or a retry. ``content_policy_blocked`` too: the
+    WHOLE refused turn is erased from the conversation — the user message, any tool rounds that ran,
+    and the refusal (the owner rewinds it durably: the gateway owner-side for Bot Chat, the CLI/ACP
+    owner for their direct DB; in-memory surfaces return the pre-refusal history). Erasing the whole
+    turn (tool rounds included) is deliberate: the user keeps SEEING the message in the chat, but the
+    model is never re-sent the content that tripped the filter, so the chat is not locked. A closing
+    boundary would only be written to be rewound. Idempotence
+    is keyed on the DURABLE tail (``SessionDB.latest_conversation_role``), so a redelivery or a tail
+    already closed by another writer is a no-op, and the gateway's own closer then no-ops in turn.
     """
     try:
         if not isinstance(result, dict) or result.get("completed") is True:
             return
         if (
             result.get("compression_exhausted") or result.get("compression_deferred")
-            or result.get("failure_reason") == "context_overflow"
+            or result.get("failure_reason") in ("context_overflow", "content_policy_blocked")
         ):
             return
         messages = result.get("messages")

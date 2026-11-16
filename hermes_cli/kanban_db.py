@@ -110,6 +110,13 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# The subset of ``VALID_BLOCK_KINDS`` that means a HUMAN is holding the card.
+# ``dependency`` is deliberately absent: it is the lane that waits for parents,
+# and it MUST stay promotable the moment they land. ``transient`` is absent
+# too — it is a retryable condition, and its own ``blocked`` event (not the
+# column) is what makes it sticky.
+HUMAN_GATE_BLOCK_KINDS = {"needs_input", "capability"}
+
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
@@ -242,6 +249,7 @@ _TICK_ACTIVITY_FIELDS = (
 
 def _fire_dispatch_tick_hook(
     result: DispatchResult, *, board: Optional[str] = None, dry_run: bool = False,
+    pacing_receipt: Optional[dict[str, Any]] = None,
 ) -> None:
     """``on_kanban_dispatch_tick`` — strictly AFTER ``_dispatch_tick_lock`` is
     released so a slow subscriber cannot stall a sibling dispatcher.
@@ -250,6 +258,11 @@ def _fire_dispatch_tick_hook(
     ``dispatch_once`` strictly AFTER ``_dispatch_tick_lock`` has been released — the original fired inside
     the lock, so a slow subscriber could extend the single-writer critical section and stall a sibling
     dispatcher's tick. Observer-only and fully best-effort: any subscriber failure is swallowed.
+
+    ``pacing_receipt`` is the JEV pacer's class (f) receipt for this tick, when
+    the pacer reported a stall episode. It is ENRICHMENT for the bus's own
+    class (f) event, never a second alarm: the bus keeps sole authority over
+    whether to page, against its own host-side ledger and dedupe window.
     """
     if not _kanban_observer_consumed("on_kanban_dispatch_tick"):
         return
@@ -270,6 +283,7 @@ def _fire_dispatch_tick_hook(
         invoke_hook(
             "on_kanban_dispatch_tick", board=board, profile_name=profile_name,
             dry_run=bool(dry_run), outcome=outcome, result=result,
+            pacing_receipt=pacing_receipt,
         )
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban dispatch tick hook failed: %s", exc)
@@ -2003,6 +2017,43 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(trip) and bool(_json_dict(trip["payload"]).get("sticky"))
 
 
+def _park_intent(
+    conn: sqlite3.Connection, task_id: str, block_kind: Optional[str] = None,
+) -> bool:
+    """True when the card is HELD for a human and must not be auto-promoted.
+
+    The EVENT LOG is the authority, not the ``status`` column. The column is
+    a cache that several writers rewrite without recording the decision — a
+    raw board write, the dashboard's ``set_status``, a status rewrite by
+    ``unblock_task`` — while the ``blocked``/``unblocked`` event pair is the
+    audit trail of the decision itself. ``recompute_ready`` promotes on the
+    column, so a park whose column drifted (``todo`` + a pending ``blocked``
+    event) was released the moment its parent completed, and the card
+    respawned without the human input it was waiting for.
+
+    ``_has_sticky_block`` reads that log: the newest ``blocked``/``unblocked``
+    event decides, so an explicit ``kanban_unblock`` releases the park — the
+    guard must not turn a park into a permanent one.
+
+    The ``block_kind`` COLUMN is the weaker, fallback authority: it names the
+    gate holding the card, and it is what survives when the log is lost (a
+    board import, a restored snapshot). It may only park a card the log has
+    NOT released: ``unblock_task`` deliberately keeps ``block_kind`` for
+    unblock-loop detection, so a column-only park would strand a card the
+    operator released. ``dependency`` is never a park — that lane waits for
+    parents and must be promoted the instant they land.
+    """
+    if _has_sticky_block(conn, task_id):
+        return True
+    if block_kind is None or block_kind not in HUMAN_GATE_BLOCK_KINDS:
+        return False
+    released = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'unblocked' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return released is None
+
+
 def _latest_event(
     conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
@@ -2044,20 +2095,31 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).
+
+    The skip applies to BOTH lanes. A card held for a human is identified by
+    the EVENT LOG (see :func:`_park_intent`), not by its ``status`` column,
+    so a park whose column drifted back to ``todo`` is still a park: it used
+    to be promoted the moment its parent completed, and the card respawned
+    without the human input it was waiting for. The ``dependency`` lane is
+    unaffected — it waits in ``todo`` and must be promoted the moment its
+    parents land.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, block_kind, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Explicit human-intervention block; only ``unblock_task`` may exit it.
+            if _park_intent(conn, task_id, _row_get(row, "block_kind")):
+                # Held for a human. The park lives in the EVENT LOG, so it is
+                # honoured whatever the status column drifted to (``todo`` as
+                # well as ``blocked``); only an explicit ``unblock_task`` may
+                # release it.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -3208,10 +3270,6 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 

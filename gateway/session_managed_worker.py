@@ -42,6 +42,7 @@ STOP_ACK_SECONDS = 30
 LOSS_RECORD_WAIT_S = 10
 # Own session (POSIX): a worker whose owner died kills its whole group (managed_worker
 # _die_with_owner); on Windows it exits itself.
+# detached-spawn: ok — covered: the worker kills its own group when its owner dies (_die_with_owner)
 WORKER_POPEN = {'start_new_session': True, 'close_fds': True}
 
 
@@ -594,6 +595,17 @@ def _stopped_before_spawn(authority, ref, row):
     return True
 
 
+def _worker_failure_cause(cause) -> str:
+    """The worker's bounded cause code, kept only when it is one the owner already speaks.
+
+    The worker sends its cause in a closed vocabulary (``agent.managed_worker.WORKER_FAILURE_CAUSES``);
+    this re-checks it against that same set, because the value reaches an operator-facing card and
+    an unrecognised string is dropped rather than printed (#t_8c013181).
+    """
+    from agent.managed_worker import WORKER_FAILURE_CAUSES
+    return cause if isinstance(cause, str) and cause in WORKER_FAILURE_CAUSES else ''
+
+
 def _record_lost_attempt(authority, policy, exc, reason, scope):
     """Start the board disposition (``worker_lost``) for a lost Kanban card attempt; the task, or None.
 
@@ -681,6 +693,22 @@ async def admit_managed(authority, ref, row, policy):
     return await execute_managed(authority, ref, row, policy)
 
 
+async def _finalize_managed_refusal(authority, session_id, accepted):
+    """Owner-side drop of a managed worker's safety-refused turn (Bot Chat / safe-mode).
+
+    The worker flushed the refused turn to the SHARED transcript and has now exited (its lease
+    released), but a managed worker cannot rewind its own transcript — so the refused turn must be
+    dropped HERE or the next worker reloads it and the deterministic safety filter re-refuses every
+    later message (the "stuck session" report; #149708 review). No cached owner agent to evict (the
+    subprocess is gone), so session_key is None. Best-effort: a refusal must never crash settlement.
+    """
+    if accepted.get('failure_reason') != 'content_policy_blocked':
+        return
+    with suppress(Exception):
+        await authority.runner._hmwa_retain_content_policy_refused_turn(
+            session_id, None, accepted.get('refused_turn_boundary_row_id'))
+
+
 async def execute_managed(authority, ref, row, policy):
     from gateway.run_turn_progress import publish_worker_tool_event
     # This route never passes the inbound prepare step, so the worker would read ``@`` tokens as typed.
@@ -755,8 +783,13 @@ async def execute_managed(authority, ref, row, policy):
             with authority.sessions[ref.session_id].event_stream.lock:
                 if _prompt_frame(authority, ref, row, worker, frame):
                     continue
-            if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
-                raise RuntimeStoreError('managed_worker_failed')
+            if frame.get('type') == 'error' and frame.get('reason') == 'managed_worker_failed':
+                # The worker names the bounded cause it died of, so the card says WHICH refusal
+                # killed the turn instead of a bare ``managed_worker_failed``. The cause is
+                # re-checked against the same closed vocabulary the worker used: an unrecognised
+                # one is dropped rather than written onto an operator-facing card (#t_8c013181).
+                raise RuntimeStoreError('managed_worker_failed',
+                                        detail=_worker_failure_cause(frame.get('cause')))
             kind = frame.get('type')
             if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
                 continue
@@ -779,6 +812,7 @@ async def execute_managed(authority, ref, row, policy):
                 with suppress(subprocess.TimeoutExpired):
                     await asyncio.to_thread(process.wait, 10)
                 accepted = _with_stop_cause(accepted, worker)
+                await _finalize_managed_refusal(authority, scope['session_id'], accepted)
                 # Like in-process execution, settlement belongs to the drain's stream lock.
                 authority.pending_results[row['admission_id']] = {
                     'result': {**accepted, 'local_viewer': True}, 'usage': usage,
@@ -788,6 +822,13 @@ async def execute_managed(authority, ref, row, policy):
     except (Exception, asyncio.CancelledError) as exc:
         import logging
         reason = exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__
+        # The card's error text is built from this reason, so a bounded cause rides along with it:
+        # the operator reads "managed worker lost: managed_worker_failed (invalid_params)" and
+        # knows the turn was refused, not that the interpreter died for an unknown reason
+        # (#t_8c013181). The cause is already validated against the closed vocabulary above.
+        cause = getattr(exc, 'detail', '') if isinstance(exc, RuntimeStoreError) else ''
+        if reason == 'managed_worker_failed' and cause:
+            reason = f'{reason} ({cause})'
         logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
         if scope is None:
             if isinstance(exc, asyncio.CancelledError) or (
