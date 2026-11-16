@@ -10,7 +10,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
-from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+from agent.turn_nudges import _CODEX_INCOMPLETE_NUDGE
 
 
 @pytest.fixture(autouse=True)

@@ -14,7 +14,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import run_agent
-from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+from agent.turn_nudges import _CODEX_INCOMPLETE_NUDGE
 from agent.error_classifier import FailoverReason
 from tests.agent.test_run_agent_codex_responses import (
     _build_agent,

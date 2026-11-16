@@ -51,6 +51,7 @@ from agent.model_metadata import (
 from agent.context_default_record import last_defaulted_context_length
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
+from agent.turn_nudges import _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX, SYNTHETIC_NUDGE_TEXTS
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -345,6 +346,12 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "summarizing what you've found and accomplished so far, without calling any more tools."
 )
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
+# Every user-role row the agent injects as scaffolding, matched BY CONTENT because
+# SessionDB drops the metadata that marked them (see agent.turn_nudges for the WHY).
+_SYNTHETIC_USER_TURN_TEXTS = frozenset({
+    COMPRESSION_CONTINUATION_USER_CONTENT, _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
+    MAX_ITERATIONS_SUMMARY_REQUEST,
+}) | SYNTHETIC_NUDGE_TEXTS
 
 
 def _fresh_compaction_message_copy(msg: dict[str, Any]) -> dict[str, Any]:
@@ -4239,21 +4246,13 @@ Write only the summary body. Do not include any preamble or prefix."""
         if cls._is_context_summary_message(message):
             return True
         text = _content_text_for_contains(message.get("content")).strip()
-        # Recovery nudges are scaffolding, not human turns; lazy import avoids an import cycle.
-        from agent.conversation_loop import (
-            _CODEX_ACK_CONTINUATION_NUDGE, _CODEX_INCOMPLETE_NUDGE, _DEGENERATE_FINAL_NUDGE,
-            _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE, _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
-            _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB, _LENGTH_CONTINUATION_NETWORK_STUB,
-            _LENGTH_CONTINUATION_OUTPUT_LIMIT,
-        )
-        return text in {
-            COMPRESSION_CONTINUATION_USER_CONTENT, _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
-            MAX_ITERATIONS_SUMMARY_REQUEST, _CODEX_INCOMPLETE_NUDGE, _CODEX_ACK_CONTINUATION_NUDGE,
-            _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE,
-            _LENGTH_CONTINUATION_NETWORK_STUB, _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB,
-            _LENGTH_CONTINUATION_OUTPUT_LIMIT,
-        } or text.startswith((
-            _BACKGROUND_PROCESS_NOTIFICATION_PREFIX, TODO_INJECTION_HEADER + "\n", _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
+        # Recovery nudges are scaffolding, not human turns. Their text comes from the
+        # dependency-free leaf agent.turn_nudges: the turn loop that appends them is
+        # ABOVE this module in the import layering, so importing it here -- even lazily,
+        # inside this write path -- would pull the whole turn stack into a DB write.
+        return text in _SYNTHETIC_USER_TURN_TEXTS or text.startswith((
+            _BACKGROUND_PROCESS_NOTIFICATION_PREFIX, TODO_INJECTION_HEADER + "\n",
+            _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
         ))
 
     @staticmethod
