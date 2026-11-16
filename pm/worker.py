@@ -9,6 +9,15 @@ import sys
 import threading
 
 
+class _ParentGone(Exception):
+    """The PM client that asked for this work died before the result could be written.
+
+    The client is killed when the owner's handshake deadline expires; on Windows the pipe
+    write then fails with EINVAL. That is the end of an attempt, not a fault in this worker,
+    so it exits quietly instead of writing a traceback into the operator's log (#t_853294b3).
+    """
+
+
 def _read_controls(messages, pause, fd):
     # Raw reads avoid a daemon thread holding sys.stdin's buffered lock at exit.
     pending = b""
@@ -76,7 +85,15 @@ def main():
     callback_lock = threading.Lock()
 
     def send(data):
-        wire.write(json.dumps({"id": request["id"], **data}) + "\n")
+        # The reader (this worker's parent) can die first — it is killed when the owner's
+        # handshake deadline expires, which is a normal end to an attempt. On Windows that
+        # surfaces as EINVAL on the pipe write, and an unhandled traceback here would land in
+        # the profile's managed-worker.log as a scary stack the operator cannot act on. The
+        # parent is gone, so this worker's result has nowhere to go: say so and exit quietly.
+        try:
+            wire.write(json.dumps({"id": request["id"], **data}) + "\n")
+        except OSError as exc:
+            raise _ParentGone(str(exc)) from exc
 
     def callback(name, *args):
         with callback_lock:
@@ -118,7 +135,12 @@ def main():
                 error.update(package=exc.package, cause=exc.cause, remedy=exc.remedy)
             response = {"error": error}
         response["receipt"] = receipt.last_completed()
-    send({"type": "result", **response})
+    try:
+        send({"type": "result", **response})
+    except _ParentGone:
+        # The client is gone; the result has nowhere to go. Exit quietly: a traceback here
+        # would land in the operator's managed-worker.log as an unactionable stack (#t_853294b3).
+        sys.exit(0)
 
 
 if __name__ == "__main__":
