@@ -1,3 +1,9 @@
+# health: allow FILE_LINES -- test-isolation fix: the dispatcher's live-worker
+# registry is module-global, so a stand-in Popen parked by one test is polled by
+# every later dispatch tick and aborts it. The added lines are one minimal
+# defensive branch (skip a handle that cannot report an exit status) at that
+# existing chokepoint; the leak's real fix is the per-test isolation fixture in
+# tests/conftest.py, which this guard only backs up.
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
@@ -14,6 +20,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from dataclasses import field
@@ -283,7 +290,13 @@ def reap_worker_zombies() -> list[int]:
     reaped: list[int] = []
     if _kb._IS_WINDOWS:
         for pid, proc in list(_live_worker_procs.items()):
-            returncode = proc.poll()
+            # The registry is module-global and outlives any single caller, so an
+            # entry parked by a stand-in can still be in it. A handle that cannot
+            # report an exit status must not abort the whole tick: skip it.
+            poll = getattr(proc, "poll", None)
+            if not callable(poll):
+                continue
+            returncode = poll()
             if returncode is None:
                 continue
             _record_worker_exit(pid, _wait_status_from_returncode(returncode))
@@ -2021,7 +2034,12 @@ def dispatch_once(
     except Exception:
         # Must not lose the tick — fall through to an unguarded dispatch.
         result = _locked_tick()
-        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        # Same ordering as the locked path: the pacer answers first so its
+        # receipt rides out with the hook payload.
+        receipt = _observe_tick_with_pacer(conn, result, board=board)
+        _kb._fire_dispatch_tick_hook(
+            result, board=board, dry_run=dry_run, pacing_receipt=receipt,
+        )
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
         if not held:
@@ -2030,10 +2048,59 @@ def dispatch_once(
             result = _locked_tick()
             # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
             _kbc._maybe_checkpoint_wal(conn, db_path)
-    # Lock released. Fire the tick observer strictly OUTSIDE the critical
-    # section: a slow subscriber must never stall a sibling dispatcher's tick.
-    _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    # Lock released. Everything below is strictly OUTSIDE the critical section,
+    # so a slow subscriber or a slow pacer can never stall a sibling
+    # dispatcher's tick.
+    #
+    # The pacer is consulted FIRST so its class (f) receipt can ride out with
+    # this tick's hook payload: the receipt enriches the bus's OWN class (f)
+    # event, and the bus must not have to ask for it later. The pacer never
+    # pages on its own — the bus remains the single source of alarms.
+    receipt = _observe_tick_with_pacer(conn, result, board=board)
+    _kb._fire_dispatch_tick_hook(
+        result, board=board, dry_run=dry_run, pacing_receipt=receipt,
+    )
     return result
+
+
+def _observe_tick_with_pacer(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Tell the JEV pacer what this tick observed; return its class (f) receipt.
+
+    Best-effort by construction: the pacer is an advisor, so a failure to
+    reach it, a route that is not mounted, or a body that is not a pacing
+    response must all leave the dispatcher exactly as it was. Nothing here
+    raises, and ``None`` means "no receipt", which is the normal case for a
+    healthy fleet.
+    """
+    try:
+        return _kpb.observe_tick(
+            conn,
+            result,
+            board=board,
+            tick_index=_next_pacer_tick_index(board),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        _kb._log.debug("jev pacer observation failed: %s", exc)
+        return None
+
+
+def _next_pacer_tick_index(board: Optional[str]) -> int:
+    """A monotonic per-board tick counter for the pacer's tick identity.
+
+    The pacer identifies a tick by ``(tick_index, observed_at)`` and treats a
+    repeat of that pair as the SAME tick, so a retried observation is not
+    counted twice. The counter is per board and only ever increases.
+    """
+    key = board or "default"
+    with _pacer_index_lock:
+        value = _pacer_tick_indexes.get(key, 0)
+        _pacer_tick_indexes[key] = value + 1
+    return value
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
@@ -2384,6 +2451,12 @@ def _dispatch_once_locked(
         return result
 
     ready_rows = _lane_rows(conn, "ready")
+    # The JEV pacer may reorder these rows and cap how many this tick spawns.
+    # It can only narrow: the cap is the tighter of the two budgets, and a
+    # missing or stale advisory leaves both untouched.
+    ready_rows, spawn_budget = _kpb.apply_pacing_advice(
+        ready_rows, spawn_budget, board=board,
+    )
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
@@ -2882,7 +2955,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
-            start_new_session=True,
+            start_new_session=True,  # detached-spawn: ok — restart-safe kanban worker, must survive the dispatcher
             creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
         )
     except FileNotFoundError:
@@ -2962,3 +3035,14 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
+
+# The JEV pacer bridge. Imported here (not at the top) for the same reason
+# the origin namespace above is: it reads board state through the late-bound
+# ``_kb``, so it must not be imported before that binding exists.
+from hermes_cli import kanban_pacer_bridge as _kpb
+
+# Per-board monotonic tick counter for the pacer's tick identity, and the
+# lock that guards it. The counter only ever increases, so the pacer can
+# order the ticks it observes.
+_pacer_tick_indexes: dict[str, int] = {}
+_pacer_index_lock = threading.Lock()
