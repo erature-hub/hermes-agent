@@ -2057,8 +2057,13 @@ def _park_intent(
 def _latest_event(
     conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
-    """Newest ``task_events`` row of ``kind`` (optionally scoped to one run)."""
-    sql = "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?"
+    """Newest ``task_events`` row of ``kind`` (optionally scoped to one run).
+
+    ``run_id`` is selected too, so a caller can recover the run a handoff
+    event belongs to -- that run's profile IS the implementer for a handoff
+    recorded before the event carried it.
+    """
+    sql = "SELECT payload, run_id FROM task_events WHERE task_id = ? AND kind = ?"
     params: tuple[Any, ...] = (task_id, kind)
     if run_id is not None:
         sql += " AND run_id = ?"
@@ -2271,43 +2276,11 @@ def claim_review_task(
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
-    separately from the implementer."""
-    now = int(time.time())
-    lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
-        if not _parents_satisfied(conn, task_id):
-            demoted = conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
-            )
-            if demoted.rowcount == 1:
-                _append_event(
-                    conn, task_id, "dependency_wait",
-                    {"reason": "parent_reopened", "source_status": "review"},
-                )
-            return None
-        run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
-        )
-        if run_id is None:
-            return None
-        return get_task(conn, task_id)
+    separately from the implementer.
 
-
-def _retry_status_for_run(
-    conn: sqlite3.Connection, task_id: str, run_id: Optional[int] = None,
-) -> str:
-    """``review`` when the run's ``claimed`` event says ``source_status=review``,
-    else ``ready`` — one place, so crash/timeout/reclaim can't silently turn a
-    reviewer run into an implementation run."""
-    if run_id is None:
-        run_id = _current_run_id(conn, task_id)
-    if run_id is None:
-        return "ready"
-    event = _latest_event(conn, task_id, "claimed", run_id)
-    payload = _json_dict(_row_get(event, "payload"))
-    return "review" if payload.get("source_status") == "review" else "ready"
+    Lives in :mod:`hermes_cli.kanban_review` with the rest of the review
+    lane; re-exported here for the callers that reach it as ``kb.*``."""
+    return _claim_review_task(conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer)
 
 
 # Run outcome -> lifecycle status a goal loop should report for a handed-off run.
@@ -3374,13 +3347,14 @@ def request_review(
                     "override) instead of clearing the live run's claim",
                 )
             if reviewer is None:
-                reviewer = _prior_reviewer(conn, task_id)
-                if reviewer is False:
+                prior = prior_reviewer(conn, task_id)
+                if prior is False:
                     return _ret(
                         False, "re-review has no durable reviewer provenance (the "
                         "latest changes_requested event is missing or "
                         "malformed); pass reviewer= explicitly",
                     )
+                reviewer = prior
             reviewer = _canonical_assignee(reviewer)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
@@ -3447,32 +3421,24 @@ def request_review(
     return _ret(True)
 
 
-def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
-    """Reviewer recorded by the latest ``changes_requested`` run's event.
-    ``None`` = first review (no such run); ``False`` = a run exists but its
-    provenance is missing/malformed."""
-    changes_run = conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'changes_requested' "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if changes_run is None:
-        return None
-    changes_event = _latest_event(conn, task_id, "changes_requested", changes_run["id"])
-    reviewer = _json_dict(_row_get(changes_event, "payload")).get("reviewer")
-    return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
-
-
 def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    target_assignee: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    gating reapplied. Returns ``(ok, implementer | reason)``.
+
+    ``target_assignee`` names the profile that should do the rework and wins
+    over the handoff's own provenance -- it is how a caller routes a card whose
+    handoff predates the implementer field. A handoff that carries no
+    implementer is recovered from the board's own run history rather than
+    refused; see :mod:`hermes_cli.kanban_review`.
+    """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3497,10 +3463,17 @@ def request_changes(
         requested_event = _latest_event(conn, task_id, "review_requested")
         if requested_event is None:
             return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
+        # The card's owner is the reviewer: ``request_review`` reassigned it.
+        reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        implementer, provenance = resolve_implementer(
+            conn, task_id,
+            handoff_payload_raw=_row_get(requested_event, "payload"),
+            handoff_run_id=_row_get(requested_event, "run_id"),
+            assignee=reviewer, current_run_id=current_run_id,
+            target_assignee=target_assignee,
+        )
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
-        reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -3522,15 +3495,16 @@ def request_changes(
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
+        # ``provenance_source`` says where a recovered implementer came from,
+        # so the repair is auditable from the event log alone.
         _append_event(
-            conn,
-            task_id,
-            "changes_requested",
+            conn, task_id, "changes_requested",
             {
                 "reason": reason,
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                **({"provenance_source": provenance} if provenance else {}),
             },
             run_id=run_id,
         )
@@ -4290,4 +4264,10 @@ from hermes_cli.kanban_db_dispatch import (
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+)
+from hermes_cli.kanban_review import (
+    claim_review_task as _claim_review_task,
+    prior_reviewer,
+    resolve_implementer,
+    retry_status_for_run as _retry_status_for_run,
 )
