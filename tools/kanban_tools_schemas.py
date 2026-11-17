@@ -283,6 +283,11 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "target_assignee": _prop("string", (
+                "Optional. The profile that should do the rework. It wins "
+                "over the handoff's recorded implementer, and rescues a card "
+                "whose review handoff predates implementer provenance."
+        )),
     },
     ["reason"],
 )
