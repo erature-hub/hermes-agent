@@ -306,9 +306,10 @@ class TestUnifiedCronjobTool:
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]
 
-        paused = json.loads(cronjob(action="pause", job_id=job_id))
+        paused = json.loads(cronjob(action="pause", job_id=job_id, reason="operator hold"))
         assert paused["success"] is True
         assert paused["job"]["state"] == "paused"
+        assert paused["job"]["paused_reason"] == "operator hold"
 
         resumed = json.loads(cronjob(action="resume", job_id=job_id))
         assert resumed["success"] is True
@@ -856,3 +857,47 @@ class TestScheduleKnobToolSurface:
             action="create", prompt="x", schedule="every 2h", grace_minutes=30))
         assert created["success"] is False
         assert "grace_minutes" in created["error"]
+
+
+class TestCronjobPauseNeedsReason:
+    """The agent door of the pause-reason guardrail.
+
+    The Nov-1 hindsight teardown paused hindsight's crons through this very tool with a null
+    ``paused_reason``: nothing on disk said why they had stopped. A pause without a reason is
+    now refused, and the tool schema advertises the ``reason`` field the agent must pass.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_schema_advertises_the_reason_field(self):
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+
+        props = CRONJOB_SCHEMA["parameters"]["properties"]
+        assert "reason" in props
+        assert props["reason"]["type"] == "string"
+
+    def test_pause_without_a_reason_is_refused(self):
+        created = json.loads(cronjob(
+            action="create", prompt="digest", schedule="every 1h", name="guarded"))
+        result = json.loads(cronjob(action="pause", job_id=created["job_id"]))
+        assert result["success"] is False
+        assert "reason" in result["error"].lower()
+
+        from cron.jobs import get_job
+        assert get_job(created["job_id"])["enabled"] is True
+
+    def test_pause_with_a_reason_is_stored(self):
+        created = json.loads(cronjob(
+            action="create", prompt="digest", schedule="every 1h", name="guarded"))
+        result = json.loads(cronjob(
+            action="pause", job_id=created["job_id"], reason="disk pressure"))
+        assert result["success"] is True, result
+
+        from cron.jobs import get_job
+        stored = get_job(created["job_id"])
+        assert stored["enabled"] is False
+        assert stored["paused_reason"] == "disk pressure"

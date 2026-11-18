@@ -620,7 +620,8 @@ async def test_trigger_cron_job_forces_paused_job_atomically(
         schedule="every 1h",
         name="paused-trigger-job",
     )
-    _web_server_cron._call_cron_for_profile("worker_alpha", "pause_job", job["id"])
+    _web_server_cron._call_cron_for_profile(
+        "worker_alpha", "pause_job", job["id"], reason="operator hold")
     observed = {}
 
     class ForceProvider:
@@ -660,7 +661,8 @@ async def test_trigger_paused_job_rejects_legacy_provider_without_mutating_job(
         schedule="every 1h",
         name="legacy-paused-trigger-job",
     )
-    _web_server_cron._call_cron_for_profile("worker_alpha", "pause_job", job["id"])
+    _web_server_cron._call_cron_for_profile(
+        "worker_alpha", "pause_job", job["id"], reason="operator hold")
     calls = []
 
     class LegacyProvider:
