@@ -1,0 +1,10 @@
+{
+  "name": "@erature/vertical-stack",
+  "repo": "https://github.com/erature-hub/hermes-agent.git",
+  "ref": "a8b7a09c9323f2a99a03351af68717c7c04bfab6",
+  "path": "plugins/distribution/manifest.json",
+  "publisher_public_key": "NKMo2gCzVw55Iqw63kmZnIYE0zECASMLARrv1C2hCJM=",
+  "version": "1.0.0",
+  "description": "The Erature sovereign vertical stack: episodic memory (Hindsight), a memory-aware reading surface, specialized task dispatch, and output grading.",
+  "maintainer": "Erature"
+}
