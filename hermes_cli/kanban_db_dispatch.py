@@ -27,12 +27,12 @@ from dataclasses import field
 from pathlib import Path
 from typing import Any
 from typing import Callable
-from typing import Iterable
 from typing import Iterator
 from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_dispatch_suppression import CapacityHold
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -156,35 +156,11 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
-
-
-def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
-    """One line naming why the tick(s) held ready work back, or ``""``.
-
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
-    """
-    counts: dict[str, int] = {}
-    pressure: Optional[str] = None
-    for res in results:
-        if res is None:
-            continue
-        for _task_id, reason in res.respawn_guarded:
-            counts[reason] = counts.get(reason, 0) + 1
-        if res.rate_limited:
-            counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
-        if res.skipped_locked:
-            counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
-        if res.memory_pressure:
-            pressure = res.memory_pressure
-    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
-    if pressure:
-        parts.append(f"memory_pressure={pressure}")
-    return ", ".join(parts)
+    capacity_holds: dict[str, CapacityHold] = field(default_factory=dict)
+    """Concurrency caps that refused a spawn this tick, keyed by scope
+    (``max_in_progress``, ``max_spawn``) plus ``:assignee`` for the
+    per-profile cap. A saturated fleet is NOT a broken fleet: the cap is the
+    constraint the operator has to see, so the warnings quote it (#111910)."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2158,6 +2134,10 @@ def _dispatch_lane_task(
         current = per_profile_running.get(assignee, 0)
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
+            # The profile's own ceiling held this card back — name it so the
+            # warning reads as saturation, not a broken fleet (#111910).
+            result.capacity_holds[f"max_in_progress_per_profile:{assignee}"] = CapacityHold(
+                "max_in_progress_per_profile", per_profile_cap, current, assignee)
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
@@ -2321,12 +2301,18 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            # Record WHY the tick refused to spawn: a saturated board is not a
+            # broken one, and the warnings must name the cap (#111910).
+            result.capacity_holds["max_spawn"] = CapacityHold(
+                "max_spawn", max_spawn, running_count)
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_holds["max_in_progress"] = CapacityHold(
+                "max_in_progress", max_in_progress, total_running)
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

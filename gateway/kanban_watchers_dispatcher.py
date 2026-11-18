@@ -320,6 +320,22 @@ def _default_profile_secret_scope():
         reset_secret_scope(token)
 
 
+def log_dispatcher_stuck(bad_ticks: int, results: Optional[list]) -> None:
+    """Warn that the ready queue is non-empty but no worker spawned.
+
+    The cause is carried by the tick result: a tick refused by a concurrency
+    cap is SATURATION, not a broken fleet, so the message names the cap and
+    drops the profile-health checklist that sends the operator after venv,
+    PATH and credential fixes which cannot change the outcome (#111910).
+    """
+    from hermes_cli import kanban_dispatch_suppression as _kds
+
+    tick_results = [res for _slug, res in (results or [])]
+    logger.warning(
+        "kanban dispatcher stuck: %s", _kds.stuck_message(bad_ticks, tick_results)
+    )
+
+
 def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False

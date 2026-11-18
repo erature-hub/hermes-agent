@@ -16,6 +16,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
+from hermes_cli import kanban_dispatch_suppression as kds
 from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
 
 
@@ -113,6 +114,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "capacity_holds": [
+                {
+                    "scope": hold.scope,
+                    "limit": hold.limit,
+                    "running": hold.running,
+                    "assignee": hold.assignee,
+                }
+                for hold in res.capacity_holds.values()
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -154,6 +164,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    for hold in res.capacity_holds.values():
+        print(
+            f"At capacity ({hold.render()}): the concurrency cap left no spawn slot "
+            f"this tick"
+        )
     return 0
 
 
@@ -166,6 +181,16 @@ _DAEMON_DEPRECATED = (
     "attempts before auto-block\n\nRunning both the gateway AND this standalone daemon will\nrace "
     "for claims. If you truly need the old standalone\ndaemon (no gateway available), rerun with "
     "--force."
+)
+
+
+# Operator guidance for the daemon's "dispatcher stuck" warning when no
+# concurrency cap refused the spawn — the daemon also points at blocked cards
+# whose workers failed to start.
+_DAEMON_PROFILE_GUIDANCE = (
+    "Check profile health (venv, PATH, credentials) and `hermes kanban list "
+    "--status ready` / `hermes kanban list --status blocked` for recent "
+    "spawn_failed tasks."
 )
 
 
@@ -223,14 +248,12 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
             if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
+                message = kds.stuck_message(
+                    health_state["bad_ticks"], [res],
+                    profile_guidance=_DAEMON_PROFILE_GUIDANCE,
+                )
                 print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
+                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: {message}",
                     file=sys.stderr, flush=True,
                 )
                 health_state["last_warn_at"] = now

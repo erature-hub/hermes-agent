@@ -29,6 +29,7 @@ from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
     _resolve_dispatcher_settings,
+    log_dispatcher_stuck,
 )
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -311,14 +312,10 @@ class GatewayKanbanWatchersMixin:
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
-                    logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned.%s Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks, f" Last tick held back: {held}." if held else "",
-                    )
+                    # The warning builder owns the capacity-vs-broken-fleet
+                    # decision: a fleet at its cap is healthy, so it must not
+                    # be reported as a profile-health problem (#111910).
+                    log_dispatcher_stuck(bad_ticks, results)
                     last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
