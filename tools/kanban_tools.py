@@ -438,12 +438,19 @@ def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
     return {n: getattr(obj, n) if obj is not None else None for n in names}
 
 
-def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
+def _task_summary_dict(kb, conn, task, latest_summary: Optional[str] = None) -> dict[str, Any]:
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
     return {
         **_fields(task, _TASK_SUMMARY_FIELDS), "parents": parents, "children": children,
-        "parent_count": len(parents), "child_count": len(children)}
+        "parent_count": len(parents), "child_count": len(children),
+        # The worker's handoff prose. Workers hand off via ``summary`` and leave
+        # ``tasks.result`` NULL, so without this a listing shows closed cards
+        # with no account of what they produced. ``None`` means this card
+        # genuinely has no handoff — a different fact from the field being
+        # absent, and distinguishable from evidence that exists but is
+        # unreachable. Never substitute ``tasks.result`` here.
+        "latest_summary": latest_summary}
 
 
 # --- Goal-mode judge gate ---
@@ -677,7 +684,12 @@ def _handle_show(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
         return json.dumps({
-            "task": _fields(task, _TASK_FIELDS),
+            "task": {**_fields(task, _TASK_FIELDS),
+                     # The worker's handoff prose, beside ``result``. Workers
+                     # hand off via ``summary`` and leave ``tasks.result`` NULL,
+                     # so without this a reader must reach into ``runs[]`` to
+                     # learn what the card produced.
+                     "latest_summary": kb.latest_summary(conn, tid)},
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
             # gate is not holding it and kanban_complete will refuse.
@@ -714,8 +726,11 @@ def _handle_list(args: dict, **kw) -> str:
             tenant=args.get("tenant"), include_archived=include_archived, limit=limit + 1)
         truncated = len(rows) > limit
         tasks = rows[:limit]
+        # One window-function query for every card's handoff prose (the same
+        # helper the CLI and the dashboard use) — not one query per card.
+        summary_map = kb.latest_summaries(conn, [t.id for t in tasks])
         return json.dumps({
-            "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
+            "tasks": [_task_summary_dict(kb, conn, t, summary_map.get(t.id)) for t in tasks],
             "count": len(tasks), "limit": limit, "truncated": truncated,
             "next_limit": (min(limit * 2, KANBAN_LIST_MAX_LIMIT)
                            if truncated and limit < KANBAN_LIST_MAX_LIMIT else None),
