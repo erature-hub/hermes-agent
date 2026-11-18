@@ -84,6 +84,11 @@ export const enErrorCodes: ThreadCopy['errorCodes'] = {
     body: provider =>
       `${provider} couldn't accept how this conversation is structured. Switch provider, or start a new chat if it keeps happening.`
   },
+  model_not_loaded: {
+    title: 'The model is not loaded',
+    body: () =>
+      `Your local server has the model on disk but is not running it. Load it, then send your message again — your conversation is fine and nothing was lost.`
+  },
   truncated: {
     title: 'The reply was cut short',
     body: (_provider, model) =>
