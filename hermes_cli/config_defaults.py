@@ -2265,6 +2265,12 @@ DEFAULT_CONFIG = {
         "auto_archive": False,
         # Idle days before auto-archive hides a session (only when auto_archive is true).
         "auto_archive_days": 3,
+        # Compact state.db in place (dedup the reasoning_content echo, shrink a finished worker's
+        # read receipts, prune idle sessions, VACUUM) on the same min_interval_hours cadence.
+        # Separate from auto_prune because a store whose bulk is RECENT payload has no prunable
+        # rows: the prune reclaims nothing and the file only grows (measured: 2.1 GiB with
+        # auto_prune on). Off by default: it rewrites rows, so only the store's owner may do it.
+        "auto_compact": False,
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,

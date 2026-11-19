@@ -69,6 +69,16 @@ def _run_state_db_auto_maintenance(session_db) -> None:
             vacuum=bool(cfg.get("vacuum_after_prune", True)),
             sessions_dir=_hermes_home_maint / "sessions",
         )
+        # Compaction is separate from the retention prune: a store can be multi-GB while NOTHING is
+        # old enough to prune (the bulk is recent, duplicated payload), so the prune above
+        # reclaims nothing and the store keeps growing. Off by default (it rewrites rows, and
+        # only the store's owner may do that); opt in with sessions.auto_compact.
+        if cfg.get("auto_compact", False):
+            session_db.maybe_auto_compact(
+                idle_days=float(cfg.get("retention_days", 90)),
+                min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+                sessions_dir=_hermes_home_maint / "sessions",
+            )
     except Exception as exc:
         logger.debug("state.db auto-maintenance skipped: %s", exc)
 

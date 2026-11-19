@@ -4378,7 +4378,8 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
     from hermes_cli.config import load_config as _load_full_config
     from hermes_state_registry import acquire, release_or_close
     _sess_cfg = (_load_full_config().get("sessions") or {})
-    if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
+    if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)
+            or _sess_cfg.get("auto_compact", False)):
         return
     _adb = acquire()
     try:
@@ -4392,6 +4393,14 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
                 min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
                 min_vacuum_interval_days=int(_sess_cfg.get("min_vacuum_interval_days", 30)),
                 vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                sessions_dir=_profile_sessions_dir(launch))
+        # Compaction is separate from the retention prune: a store can be multi-GB while NOTHING is
+        # old enough to prune (the bulk is recent, duplicated payload), so the prune above reclaims
+        # nothing and the store only grows. Opt in with sessions.auto_compact.
+        if _sess_cfg.get("auto_compact", False):
+            _adb.maybe_auto_compact(
+                idle_days=float(_sess_cfg.get("retention_days", 90)),
+                min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
                 sessions_dir=_profile_sessions_dir(launch))
     finally:
         release_or_close(_adb)

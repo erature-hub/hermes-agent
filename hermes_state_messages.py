@@ -374,6 +374,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             for column in ("reasoning", "reasoning_content"):
                 if row[column] is not None:
                     msg[column] = row[column]
+            if row["reasoning_content"] is None and row["reasoning"]:
+                # The compaction dropped a byte-identical echo; restore it (see the projection in
+                # _rows_to_conversation). Consumers read reasoning_content DIRECTLY.
+                msg["reasoning_content"] = row["reasoning"]
             for column in ("reasoning_details", "codex_reasoning_items", "codex_message_items"):
                 if row[column]:
                     msg[column] = _json_or(
@@ -1319,6 +1323,20 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 msg["tool_calls"], [], f"Failed to deserialize tool_calls in {warn_context}, falling back to []")
         if msg.get("display_metadata") is not None:
             msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+        # The state.db compaction drops a byte-identical ``reasoning_content`` echo of ``reasoning``
+        # (measured: 0.48 GiB of pure duplication on one profile), so a row can carry the reasoning
+        # text with no echo column left. Restore the echo, because consumers read
+        # ``reasoning_content`` DIRECTLY -- the Anthropic converter builds its thinking block from
+        # ``m.get("reasoning_content")``, not from the ``_replayable_reasoning_text`` fallback -- so a
+        # missing echo would silently drop the thinking block on a replayed tool-call turn.
+        #
+        # Exact, not approximate: the writer never stores ``reasoning`` without its echo (every path
+        # that sets ``reasoning`` sets ``reasoning_content`` too, or the promotion tiers in
+        # chat_completion_helpers do), so a row with ``reasoning`` but no ``reasoning_content`` is
+        # one the compaction touched.
+        if (msg.get("role") == "assistant" and msg.get("reasoning")
+                and msg.get("reasoning_content") is None):
+            msg["reasoning_content"] = msg["reasoning"]
         # A `SELECT *` picks up every column, including any BLOB added to the schema later; the
         # JSON encoder that serves these dicts over HTTP fails outright on raw bytes. Drop them
         # here, once, rather than needing a new named pop for each future binary column. Known
@@ -1632,6 +1650,20 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 msg.update((col, row[col]) for col in ("finish_reason", "reasoning") if row[col])
                 if row["reasoning_content"] is not None:
                     msg["reasoning_content"] = row["reasoning_content"]
+                elif row["reasoning"]:
+                    # The state.db compaction drops a byte-identical ``reasoning_content`` echo of
+                    # ``reasoning`` (measured: 0.48 GiB of pure duplication on one profile), so a
+                    # row can carry the reasoning text with no echo column left. Restore the echo
+                    # here, because consumers read ``reasoning_content`` DIRECTLY -- the Anthropic
+                    # converter builds its thinking block from ``m.get("reasoning_content")``, not
+                    # from the ``_replayable_reasoning_text`` fallback -- so a missing echo would
+                    # silently drop the thinking block on a replayed tool-call turn.
+                    #
+                    # Exact, not approximate: the writer never stores ``reasoning`` without its
+                    # echo (every path that sets ``reasoning`` sets ``reasoning_content`` too, or
+                    # the promotion tiers in chat_completion_helpers do), so a row that has
+                    # ``reasoning`` but no ``reasoning_content`` is one the compaction touched.
+                    msg["reasoning_content"] = row["reasoning"]
                 msg.update(
                     (col, _json_or(row[col], None, f"Failed to deserialize {col}, falling back to None"))
                     for col in ("reasoning_details", "codex_reasoning_items", "codex_message_items") if row[col])

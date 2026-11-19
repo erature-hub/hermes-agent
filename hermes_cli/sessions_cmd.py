@@ -1120,6 +1120,98 @@ def _cmd_optimize_storage(db, args):
         print("  (VACUUM was skipped or failed — run `hermes sessions optimize` later to reclaim freed space.)")
 
 
+def _cmd_compact(db, args):
+    """Reclaim a bloated store's space in one bounded pass (see SessionDB.compact_store)."""
+    db_path = db.db_path
+    before_bytes = db_path.stat().st_size if db_path.exists() else 0
+    before_mb = before_bytes / (1024 * 1024)
+
+    idle_days = 30.0
+    raw_age = str(getattr(args, "older_than", "30") or "30").strip()
+    if raw_age not in ("0", "0d", "0 days", "0h"):
+        from hermes_cli.session_filters import parse_duration_seconds
+        try:
+            seconds = parse_duration_seconds(raw_age)
+        except Exception:
+            seconds = None
+        if seconds is None:
+            print(f"Error: --older-than '{raw_age}' is not a duration. Use days (30) or a duration "
+                  f"like '5h'/'2d'/'1w'.")
+            return 1
+        idle_days = seconds / 86400.0
+    do_prune = not getattr(args, "no_prune", False)
+    do_vacuum = not getattr(args, "no_vacuum", False)
+
+    print(f"Compacting {db_path}\n  Current database size: {before_mb:.1f} MB")
+    if do_prune:
+        print(f"  Pruning sessions idle beyond {idle_days:g} day(s)")
+    print("  Squeezing payload (duplicate reasoning echo, finished-worker read receipts)")
+    if not do_vacuum:
+        print("  VACUUM skipped (--no-vacuum): the file will not shrink until a later VACUUM")
+
+    try:
+        free_bytes = shutil.disk_usage(db_path.parent).free
+    except Exception:
+        free_bytes = None
+    if do_vacuum and free_bytes is not None and before_bytes > 0:
+        # VACUUM rewrites the file and needs a second copy's worth of headroom.
+        need = before_bytes
+        print(f"  Free disk: {free_bytes / (1024 * 1024):.0f} MB (need ~{need / (1024 * 1024):.0f} MB)")
+        if free_bytes < need:
+            print("\n⚠ Not enough free disk to VACUUM safely. Re-run with --no-vacuum to reclaim the "
+                  "rows now and VACUUM later.")
+            return 1
+
+    if not getattr(args, "yes", False) and (refused := _confirm_or_exit_code("Proceed? [y/N] ")) is not None:
+        return refused
+
+    owner = getattr(args, "owner_endpoint", None)
+    if owner is not None:
+        # The gateway owns the store: it does the rewrite, this process never writes.
+        from hermes_cli.sessions_owner import owner_compact
+        try:
+            report = owner_compact(
+                owner,
+                idle_days=idle_days,
+                drop_duplicate_reasoning=not getattr(args, "keep_reasoning_echo", False),
+                vacuum=do_vacuum,
+                include_archived=True,
+            )
+        except Exception as exc:
+            print(f"Error: the gateway did not complete the compaction ({exc}). "
+                  f"Re-run `hermes sessions compact` once the gateway is healthy.")
+            return 1
+    else:
+        try:
+            report = db.compact_store(
+                idle_days=idle_days,
+                drop_duplicate_reasoning=not getattr(args, "keep_reasoning_echo", False),
+                vacuum=do_vacuum,
+                sessions_dir=_sessions_dir(),
+            )
+        except KeyboardInterrupt:
+            print("\nInterrupted — no data was lost; re-run to resume.")
+            return 130
+        except Exception as e:
+            print(f"Error: compaction failed: {e}\nNo data was lost. Re-run to resume.")
+            return 1
+
+    freed_mb = report.get("freed_bytes", 0) / (1024 * 1024)
+    print("✓ Compaction complete.")
+    print(f"  Sessions pruned        : {report.get('pruned', 0)}")
+    print(f"  Receipts compacted     : {report.get('receipts_compacted', 0)}")
+    print(f"  Duplicate reasoning    : {report.get('reasoning_deduped', 0)} row(s)")
+    print(f"  Reclaimed              : {freed_mb:.1f} MB")
+    if report.get("vacuum_skipped_holders"):
+        print(f"  (VACUUM skipped: {report['vacuum_skipped_holders']} other process(es) hold the store — "
+              f"re-run with every holder stopped to return the space to the OS)")
+    elif not report.get("vacuumed") and do_vacuum:
+        print("  (VACUUM did not complete — re-run with every holder stopped to return the space to the OS)")
+    after_mb = db_path.stat().st_size / (1024 * 1024) if db_path.exists() else 0.0
+    print(f"  Size now               : {after_mb:.1f} MB (was {before_mb:.1f} MB)")
+    return 0
+
+
 def _cmd_repair_routing(db, args):
     records = db.find_orphaned_gateway_sessions(max_gap_s=getattr(args, "max_gap_seconds", None))
     adoptable = [r for r in records if r["adoptable"]]
@@ -1386,6 +1478,7 @@ _DB_HANDLERS = {
     "archive": partial(_cmd_prune_or_archive, action="archive"), "unpin": partial(_cmd_pin, pinning=False),
     "retitle-skills": _cmd_retitle_skills, "browse": _cmd_browse, "optimize": _cmd_optimize,
     "clean-markers": _cmd_clean_markers, "optimize-storage": _cmd_optimize_storage,
+    "compact": _cmd_compact,
     "repair-routing": _cmd_repair_routing, "repair-prompts": _cmd_repair_prompts, "stats": _cmd_stats,
     "refresh-prompts": _cmd_refresh_prompts,
 }
@@ -1403,7 +1496,7 @@ def _print_empty_store(action: str, args) -> None:
 
 # VACUUM, the FTS-layout rebuild and bulk deletes rewrite the store; underneath a live gateway/Desktop/cron
 # writer that is the second-writer class behind the retired-WAL refusal (#110054). `--force` is the override.
-_HELD_STORE_ACTIONS = frozenset({"optimize", "optimize-storage", "prune"})
+_HELD_STORE_ACTIONS = frozenset({"optimize", "optimize-storage", "prune", "compact"})
 
 
 def cmd_sessions(args, sessions_parser=None):
@@ -1420,9 +1513,9 @@ def cmd_sessions(args, sessions_parser=None):
         and getattr(args, "format", None) in ("md", "qmd")
     )
     observational = action in _OBSERVATIONAL_DB_ACTIONS or (action == "export" and not deleting_export)
-    if action == "prune":
+    if action in ("prune", "compact"):
         # The always-on gateway owns the store: this process only reads the preview, the owner
-        # deletes. No gateway: the local prune below, behind the holder scan, as before.
+        # deletes/rewrites. No gateway: the local path below, behind the holder scan, as before.
         from hermes_cli.sessions_owner import live_owner
         args.owner_endpoint = live_owner()
         observational = args.owner_endpoint is not None

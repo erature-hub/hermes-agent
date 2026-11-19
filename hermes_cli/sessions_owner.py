@@ -12,6 +12,11 @@ from __future__ import annotations
 #: write, so a short client budget would only misreport a prune that still commits.
 PRUNE_RPC_TIMEOUT = 600
 
+#: A compaction rewrites the store's payload and may VACUUM a multi-GB file, so it needs a larger
+#: budget than the prune. The owner shields the write; a short budget would only misreport a
+#: compaction that still commits.
+COMPACT_RPC_TIMEOUT = 3600
+
 
 def live_owner():
     """The ready gateway endpoint serving this home, else None. Discovery only: never starts one."""
@@ -29,6 +34,22 @@ def owner_prune(endpoint, **params) -> dict:
     async def _run():
         async with connect_gateway(endpoint) as client:
             return await client.rpc("session.prune", _timeout=PRUNE_RPC_TIMEOUT, **params)
+    return asyncio.run(_run())
+
+
+def owner_compact(endpoint, **params) -> dict:
+    """Run one ``session.compact`` on *endpoint*; raises ``GatewayClientError`` on refusal/loss.
+
+    A compaction rewrites rows and VACUUMs the file, so it is the owner's write for the same
+    reason the prune is. The pass is longer than a prune (it rewrites the whole store's payload
+    and may VACUUM a multi-GB file), so it gets its own, larger budget.
+    """
+    import asyncio
+    from hermes_cli.gateway_client import connect_gateway
+
+    async def _run():
+        async with connect_gateway(endpoint) as client:
+            return await client.rpc("session.compact", _timeout=COMPACT_RPC_TIMEOUT, **params)
     return asyncio.run(_run())
 
 

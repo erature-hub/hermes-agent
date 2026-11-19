@@ -832,13 +832,36 @@ def _retired_cjk_snapshot_health(db_path: Path, conn: sqlite3.Connection) -> Opt
     return reason
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _install_bounded_integrity_check(conn: sqlite3.Connection, budget_s: float) -> None:
+    """Bound the ``PRAGMA integrity_check`` scan on *conn* to *budget_s* seconds.
+
+    A SQLite progress handler is the only way to interrupt a PRAGMA from Python: returning a
+    non-zero value makes SQLite raise ``OperationalError: interrupted`` at its next
+    checkpoint. The handler returns 0 until the deadline, so a scan that finishes in time is
+    never disturbed.
+    """
+    deadline_at = time.monotonic() + max(0.0, float(budget_s))
+
+    def _on_progress() -> int:
+        return 1 if time.monotonic() >= deadline_at else 0
+
+    conn.set_progress_handler(_on_progress, 1000)
+
+
+def _db_opens_cleanly(db_path: Path, *, integrity_budget_s: Optional[float] = None) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the first statement that trips the malformed-schema parse (``PRAGMA journal_mode``),
     ``integrity_check``, a ``sessions`` read, FTS5 MATCH probes and a rolled-back ``messages`` write — so FTS5
     index corruption (reads and ``integrity_check`` pass, every ``INSERT INTO messages`` fails through the FTS
     triggers) is reported as unhealthy.
+
+    *integrity_budget_s* bounds the full ``PRAGMA integrity_check`` scan. That scan is O(file
+    size): measured 140s on a 2.5 GiB store and 5s on the same file once the OS had it cached,
+    so on a COLD multi-GB store it dominates the whole doctor run and reads as a hang. With a
+    budget, the scan is aborted at the deadline and the reason says so, instead of the caller
+    blocking for minutes. The FTS and write probes that follow are cheap (milliseconds) and
+    still run, so the FTS-corruption class (#66724) is still detected.
 
     See #50502.
     """
@@ -855,10 +878,27 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             # Retirement must not hold the live write lock across a full integrity scan.
             if retired_cjk_index_present(conn.cursor()):
                 return _retired_cjk_snapshot_health(db_path, conn)
-            rows = conn.execute("PRAGMA integrity_check").fetchall()
-            problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
-            if problems:
-                return "; ".join(problems[:3])
+            if integrity_budget_s is not None:
+                _install_bounded_integrity_check(conn, integrity_budget_s)
+            # A budget exhaustion is neither a damage verdict nor a clean bill. Record it and
+            # keep going: the FTS and write probes below are cheap (milliseconds) and still
+            # detect the FTS-corruption class (#66724). The recorded reason is returned at the
+            # end if nothing worse turned up.
+            scan_incomplete = None
+            try:
+                rows = conn.execute("PRAGMA integrity_check").fetchall()
+            except sqlite3.OperationalError as exc:
+                if not (integrity_budget_s is not None and "interrupt" in str(exc).lower()):
+                    raise
+                scan_incomplete = HealthCheckUnavailable(
+                    f"integrity_check exceeded its {integrity_budget_s:g}s budget "
+                    f"(the store is too large to scan in full here; "
+                    f"run 'hermes sessions repair' for a full check)")
+                rows = []
+            else:
+                problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+                if problems:
+                    return "; ".join(problems[:3])
             conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
             # FTS5 read probe: partial shadow-table corruption makes MATCH/snippet/rank raise while integrity_check
             # reports healthy. MATCH '""' (empty phrase) parses, scans zero rows and exercises the shadow tables;
@@ -901,12 +941,14 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # latter let the trigram-segment collision report "healthy".
                 # Missing messages/sessions tables = brand new file mid-init, not corruption.
                 if _schema_not_built(exc):
-                    return None
+                    return scan_incomplete
                 return _ProbeFailure(f"fts5 write probe failed: {exc}", exc)
             finally:
                 with contextlib.suppress(sqlite3.Error):
                     conn.execute("ROLLBACK")
-            return None
+            # The cheap probes all passed. If the full scan had been cut short, that is still the
+            # verdict: an unscanned store is not a verified one.
+            return scan_incomplete
     except (sqlite3.DatabaseError, OSError) as exc:
         return _ProbeFailure(str(exc), exc)
 

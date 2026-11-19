@@ -3562,6 +3562,7 @@ explainer:
     corrupt: "這一輪已停止，因為狀態資料庫回報結構損毀（重新啟動後對話紀錄將會遺失）。釋放磁碟空間沒有幫助。復原選項：\n1. 執行 `hermes {profile_arg}doctor --fix`\n2. 停止閘道，然後用以下指令復原：\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   （若回報可復原）hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — 復原會先為損毀的檔案建立快照；切勿對執行中的 state.db 執行 `sqlite3 ... \".recover\"`，有漏洞的 sqlite3 CLI 可能使其損毀得更嚴重\n3. 從 {backups_dir}/ 中的備份還原\n然後再傳送一次訊息。"
     fts_index: "這一輪已停止，因為工作階段搜尋索引（FTS5）已損毀且無法卸離，因此這則訊息未儲存。訊息儲存區本身未受損：不要執行復原工具或還原備份。請執行 `hermes {profile_arg}doctor --fix`（或重新啟動 Hermes，開啟時會修復索引），然後再傳送一次訊息。"
     disk: "Hermes 無法將此對話儲存到磁碟，為避免遺失你的訊息而停止。磁碟可能已滿：請釋放一些空間（或修正 {home}/state.db 的權限），然後再傳送一次訊息。"
+    worker_receipt_timeout: "Hermes 無法儲存這段對話，因為會話儲存沒有及時回應。這是繁忙伺服器的逾時，不是磁碟空間問題：你的訊息可能仍然已儲存。請稍等片刻後重新傳送訊息。"
     default: "Hermes 無法儲存此對話，為避免遺失你的訊息而停止。可能原因：磁碟空間不足，或另一個 Hermes 程序正佔用資料庫。請關閉其他 Hermes 視窗，執行 `hermes {profile_arg}doctor` 檢查儲存狀態，然後再傳送一次訊息。"
   file_mutation:
     header: "⚠️ 檔案變更驗證器：本輪有 {count} 個檔案編輯失敗，無論上方文字如何描述皆以此為準。請執行 `git status` 或 `read_file` 確認實際寫入的內容。"

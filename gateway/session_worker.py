@@ -74,7 +74,12 @@ async def worker_request(connection, ref, params, *, operation):
     extra = {'register': {'kind'}, 'adopt': set(), 'persist': {'epoch', 'sequence', 'operation', 'payload'}}[operation]
     if set(params) != _SCOPE | extra:
         raise RuntimeStoreError('invalid_params')
-    claim = _claim(connection, ref, params)
+    # The claim reads the owner's state.db (a json_extract scan over the worker's receipts) and
+    # the psutil liveness probe; both are blocking. Run them in a thread so the gateway's event
+    # loop keeps serving every OTHER profile's RPC while this one waits. One owner process serves
+    # every profile, so a claim that blocked the loop stalled unrelated sessions' receipts and
+    # timed them out (worker_receipt_timeout -> session turn lease lost -> session_persistence_failed).
+    claim = await asyncio.to_thread(_claim, connection, ref, params)
     authority = connection.authority
     if operation == 'register':
         authority._require_admission_open()
@@ -89,7 +94,8 @@ async def worker_request(connection, ref, params, *, operation):
             **scope, kind='compute', adoption_secret=claim, require_idle=True)
     if 'worker:adopt' not in connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
-    _verify(connection, ref, params, claim)
+    # Same reason as the claim: the verification reads the owner's state.db. Off the loop.
+    await asyncio.to_thread(_verify, connection, ref, params, claim)
     if operation == 'adopt':
         return await asyncio.to_thread(adopt_worker_execution, authority.db, epoch=authority.epoch,
                                        **scope, adoption_secret=claim)

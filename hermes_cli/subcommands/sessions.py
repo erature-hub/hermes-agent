@@ -152,6 +152,30 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     _flag(sessions_prune, "--force",
         help="With no gateway running: run even while another Hermes process (Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped. With the gateway running, prune always goes through it")
 
+    sessions_compact = sessions_subparsers.add_parser(
+        "compact", help="Reclaim space from a bloated state.db (dedup payload, shrink receipts, VACUUM)",
+        description="Compact a bloated state.db in one bounded pass: prune sessions that are idle "
+            "beyond --older-than, drop the byte-identical reasoning_content echo of reasoning, shrink "
+            "a finished worker's bulky read receipts to the retirement marker (the digest survives, so "
+            "an exact retry still conflicts), and VACUUM the file. The retention prune alone reclaims "
+            "nothing on a store whose bulk is RECENT payload, which is how a profile reaches several GB "
+            "while sessions.auto_prune is on and reporting no candidates. Refuses while another Hermes "
+            "process holds the store unless --force is given.")
+    sessions_compact.add_argument("--older-than", metavar="AGE", default="30",
+        help="Also prune sessions idle beyond AGE (days if bare number, or a duration like '5h'/'2d'/'1w'). "
+             "Default 30 days. Use 0 to skip the prune and only squeeze payload.")
+    _flag(sessions_compact, "--no-vacuum", default=False,
+        help="Skip the final VACUUM (rows are reclaimed but the file does not shrink until a later VACUUM)")
+    _flag(sessions_compact, "--no-prune", default=False,
+        help="Skip the session prune; only squeeze payload and shrink receipts")
+    _flag(sessions_compact, "--keep-reasoning-echo", default=False,
+        help="Do not drop the byte-identical reasoning_content echo of reasoning")
+    _flag(sessions_compact, "--yes", "-y", default=False, help="Skip confirmation")
+    _flag(sessions_compact, "--force", default=False,
+        help="With no gateway running: run even while another Hermes process (Desktop, dashboard, cron) "
+             "holds state.db — rewriting the store under a live writer can leave every agent refusing turns "
+             "until all writers are stopped")
+
     sessions_archive = sessions_subparsers.add_parser(
         "archive", help="Bulk-archive (soft-hide) sessions matching filters — no deletion")
     _add_session_filter_args(sessions_archive, "Only archive sessions older than AGE (duration like '5h'/'2d', "

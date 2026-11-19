@@ -50,7 +50,12 @@ _EXIT_REASON_PREFIX_EXPLANATIONS = tuple(
 )
 
 # ``session_persistence_failed`` refined by the classified cause (lock contention ≠ disk full).
-_PERSISTENCE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease", "session_row_missing", "locked", "replaced", "deleted_wal", "corrupt", "fts_index", "disk"})
+# ``worker_receipt_timeout`` is an RPC stall, not storage pressure: the owner's event loop was
+# busy, so the worker's receipt never came back. It MUST NOT land on the disk/default copy
+# (which tells the user to free disk space) -- that advice is wrong for a stall and sends the
+# operator to delete data that is perfectly fine. It is classified in
+# ``hermes_state_errors.classify_persistence_error`` and rendered here.
+_PERSISTENCE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease", "session_row_missing", "locked", "replaced", "deleted_wal", "corrupt", "fts_index", "disk", "worker_receipt_timeout"})
 
 
 def _persistence_explanation_key(cause: Optional[str]) -> str:

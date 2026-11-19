@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -479,6 +481,168 @@ class SessionMaintenanceMixin:
             # write-path generation guard does not halt this connection.
             self._record_db_file_identity()
         return optimized
+
+    def compact_store(
+        self, *, idle_days: float = 30.0, include_archived: bool = True,
+        drop_duplicate_reasoning: bool = True, vacuum: bool = True,
+        sessions_dir: Optional[Path] = None,
+    ) -> dict[str, Any]:
+        """Reclaim a bloated store's space in one bounded pass, and report what it freed.
+
+        A multi-GB ``state.db`` is not free space: it is live rows. ``PRAGMA freelist_count`` on
+        the bloated profiles sat at 1.4-2.4% of the file, far under
+        :data:`AUTO_VACUUM_MIN_FREELIST_RATIO`, so the automatic path never VACUUMed and the file
+        only ever grew. Three reclaimable shapes, all data rather than slack:
+
+        * **Stale sessions** — ended and idle beyond *idle_days*. Pruned through
+          :meth:`prune_sessions`, so the same guards apply (a live turn lease, an open
+          compression lock, a busy ledger row, a compression ancestor whose continuation is
+          still retained all keep their rows).
+        * **Terminal worker receipts** — a finished worker leaves one receipt per sequence, and
+          those rows survive for as long as the SESSION does. They are the receipt ledger that
+          makes an exact retry idempotent, so the digest is kept and only the bulky
+          ``result_json`` payload is dropped, exactly as the session-deletion path does.
+        * **Duplicate reasoning** — ``reasoning_content`` is a legacy echo of ``reasoning``; where
+          the two are byte-identical the echo is pure waste (measured: 50,446 rows / 0.48 GiB on
+          novella). Only byte-identical rows are touched, so a row that genuinely differs keeps
+          both fields.
+
+        The FTS5 indexes mirror ``messages`` and are rebuilt from it, so they are compacted in
+        the same pass rather than left to drift.
+
+        *vacuum* rewrites the file and takes an exclusive lock, so it runs only when the store
+        is provably quiet (no foreign holder, no sibling generation in this process); otherwise
+        the reclaimed rows stay as free pages and ``vacuumed`` is False. Never raises: a
+        compaction that cannot complete leaves the store as it found it.
+
+        Returns ``{"pruned", "receipts_compacted", "reasoning_deduped", "vacuumed",
+        "logical_bytes_before", "logical_bytes_after", "freed_bytes"}``.
+        """
+        report: dict[str, Any] = {
+            "pruned": 0, "receipts_compacted": 0, "reasoning_deduped": 0, "vacuumed": False,
+            "logical_bytes_before": self.logical_size_bytes(), "logical_bytes_after": None,
+            "freed_bytes": 0,
+        }
+
+        # 1. Stale sessions. prune_sessions() owns the guards; it raises nothing but a
+        #    RuntimeStoreError for a busy store, which is not a failure of this pass.
+        try:
+            report["pruned"] = self.prune_sessions(
+                older_than_days=float(idle_days), sessions_dir=sessions_dir,
+                exclude_active_write_guards=True, archived=None if include_archived else False,
+            )
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("state.db compaction: session prune skipped (%s)", exc)
+
+        # 2 & 3. Reclaim the payload bytes of rows whose owning session may survive.
+        def _squeeze(conn):
+            compacted = deduped = 0
+            # A TERMINAL worker's read receipts are dead weight: a history read stores the whole
+            # transcript and a context read a full session row, so keeping them leaves one full
+            # copy per managed turn and the store grows quadratically. The codebase already
+            # shrinks a terminal execution's read receipts to the RETIRED_RECEIPT marker (the
+            # payload_digest stays, so a late duplicate with other content still conflicts, and
+            # an exact replay is refused stale_generation as after retirement). This pass
+            # applies that same shrink to terminal executions whose SESSION still exists -- the
+            # ones the retirement path never reaches, because the session outlives the worker.
+            from hermes_state_runtime_workers import RETIRED_RECEIPT
+            cur = conn.execute(
+                "UPDATE worker_receipts SET result_json=? WHERE result_json IS NOT NULL "
+                "AND json_valid(result_json) "
+                # A read receipt that carried the transcript (``messages``) or the whole session
+                # row (``session``) is the bulky one: that is a full copy of the store's own
+                # content, kept once per managed turn. The row annotations (``annotations``) are
+                # a MUTATION acknowledgement and stay replayable, so they are NOT retired here.
+                "AND (json_type(result_json, '$.messages') IS NOT NULL "
+                "OR json_type(result_json, '$.session') IS NOT NULL) "
+                "AND execution_id IN (SELECT execution_id FROM worker_executions "
+                "WHERE status = 'terminal')",
+                (json.dumps(RETIRED_RECEIPT),))
+            compacted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            if drop_duplicate_reasoning:
+                cur = conn.execute(
+                    "UPDATE messages SET reasoning_content = NULL "
+                    "WHERE reasoning IS NOT NULL AND reasoning_content IS NOT NULL "
+                    "AND reasoning = reasoning_content")
+                deduped = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            return compacted, deduped
+
+        try:
+            compacted, deduped = self._execute_write(_squeeze) or (0, 0)
+            report["receipts_compacted"] = compacted
+            report["reasoning_deduped"] = deduped
+        except (RuntimeError, ValueError, sqlite3.Error) as exc:
+            logger.warning("state.db compaction: payload squeeze skipped (%s)", exc)
+
+        # 4. VACUUM only on a provably quiet store: it rewrites every page under an exclusive
+        #    lock and retires the WAL generation a sibling writer still holds (#110054).
+        if vacuum:
+            from hermes_state_holders import (
+                foreign_state_db_holders, in_process_state_db_holders)
+            holders = (foreign_state_db_holders(self.db_path)
+                       + in_process_state_db_holders(self.db_path, exclude=self))
+            if holders:
+                report["vacuum_skipped_holders"] = len(holders)
+                logger.info(
+                    "state.db compaction: skipping VACUUM, %d other process(es) hold the store",
+                    len(holders))
+            else:
+                try:
+                    self.vacuum()
+                    report["vacuumed"] = True
+                except Exception as exc:
+                    logger.warning("state.db compaction: VACUUM failed (%s)", exc)
+
+        after = self.logical_size_bytes()
+        report["logical_bytes_after"] = after
+        before = report["logical_bytes_before"]
+        if before is not None and after is not None:
+            report["freed_bytes"] = max(0, before - after)
+        return report
+
+    def maybe_auto_compact(
+        self, *, idle_days: float = 90.0, min_interval_hours: int = 24,
+        sessions_dir: Optional[Path] = None,
+    ) -> dict[str, Any]:
+        """Run :meth:`compact_store` on a throttle, for the store's owner only.
+
+        The retention prune in :meth:`maybe_auto_prune_and_vacuum` only removes rows that are
+        OLD ENOUGH to be prunable. A store whose bulk is RECENT duplicated payload (the
+        ``reasoning_content`` echo of ``reasoning``, and read receipts that carry a full copy of
+        the transcript) stays multi-GB while the prune correctly reclaims nothing -- which is how
+        the profiles reached 2-3.5 GiB each. This is the pass that removes that payload.
+
+        Throttled on the same ``state_meta`` marker discipline as the prune (a ``last_auto_compact``
+        stamp), because the pass rewrites rows and VACUUMs the file. Never raises.
+        """
+        result: dict[str, Any] = {"skipped": False}
+        from hermes_state_repair import _release_auto_maintenance_lock, _try_acquire_auto_maintenance_lock
+        maintenance_lock = _try_acquire_auto_maintenance_lock(self.db_path)
+        if maintenance_lock is None:
+            result["skipped"] = True
+            return result
+        try:
+            now = time.time()
+            since = _seconds_since(now, self.get_meta("last_auto_compact"))
+            if since is not None and since < min_interval_hours * 3600:
+                result["skipped"] = True
+                return result
+            report_startup_progress(900.0, phase="state_db_auto_compact")
+            result.update(self.compact_store(idle_days=idle_days, sessions_dir=sessions_dir))
+            self.set_meta("last_auto_compact", str(now))
+            if result.get("freed_bytes"):
+                logger.info(
+                    "state.db auto-compaction: freed %.1f MiB (%d session(s) pruned, %d receipt(s) "
+                    "compacted, %d duplicate reasoning row(s) deduplicated)%s",
+                    result["freed_bytes"] / 1048576, result.get("pruned", 0),
+                    result.get("receipts_compacted", 0), result.get("reasoning_deduped", 0),
+                    " + VACUUM" if result.get("vacuumed") else "")
+        except Exception as exc:
+            logger.warning("state.db auto-compaction failed: %s", exc)
+            result["error"] = str(exc)
+        finally:
+            _release_auto_maintenance_lock(maintenance_lock)
+        return result
 
     def maybe_auto_prune_and_vacuum(
         self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True,

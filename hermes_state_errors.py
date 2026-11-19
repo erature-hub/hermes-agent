@@ -98,7 +98,7 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "session_row_missing", "unknown",
+    "replaced", "deleted_wal", "disk", "session_row_missing", "unknown", "worker_receipt_timeout",
 )
 
 
@@ -287,6 +287,10 @@ _PERSISTENCE_CAUSE_BY_PHRASE = (
     (("locked", "busy"), "locked"),
     # A flush rejected by the session-row FK: the row was removed under a live agent (#123583).
     (("foreign key constraint failed",), "session_row_missing"),
+    # The owner's reply never arrived within the worker's receipt budget: the owner was busy, so
+    # the store is NOT at fault. Matched by the code the worker raises
+    # (agent/runtime_session_store.py), which RPC wrapping may leave as a bare string.
+    (("worker_receipt_timeout",), "worker_receipt_timeout"),
 )
 
 

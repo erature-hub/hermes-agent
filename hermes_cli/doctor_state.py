@@ -290,14 +290,23 @@ def _session_count(state_db_path: Path):
 # Above this the snapshot copy a held store needs costs more than the probe is worth; --fix still probes.
 _WRITE_PROBE_SNAPSHOT_MAX_BYTES = 1 << 30
 
+#: The full ``PRAGMA integrity_check`` is O(file size): measured 140s on a 2.5 GiB store and 86s
+#: on a 1.45 GiB one when the OS had to read it cold (5s once cached). Doctor is a health REPORT,
+#: not a repair tool, so the scan is bounded: past the budget the probe reports a partial verdict
+#: (the cheap FTS/write probes still run and still detect the FTS-corruption class) instead of
+#: the whole doctor run appearing to hang. A full scan is ``hermes sessions repair``'s job.
+#: ``--fix`` still probes without a bound (it is the repair path, and it can afford to wait).
+_WRITE_PROBE_INTEGRITY_BUDGET_S = 2.0
+
 
 def _write_health_reason(state_db_path: Path, *, should_fix: bool):
     """FTS/write-health probe (a rolled-back BEGIN IMMEDIATE). Against a store a live writer holds,
     that probe is the second-writer class (#103339), so probe a read-only snapshot instead; a quiet
     store is probed in place. Returns the failure reason, or None when healthy or skipped."""
     from hermes_state_repair import _db_opens_cleanly, _live_writer_holds_db
+    budget = None if should_fix else _WRITE_PROBE_INTEGRITY_BUDGET_S
     if not _live_writer_holds_db(state_db_path):
-        return _db_opens_cleanly(state_db_path)
+        return _db_opens_cleanly(state_db_path, integrity_budget_s=budget)
     if not should_fix and state_db_path.stat().st_size > _WRITE_PROBE_SNAPSHOT_MAX_BYTES:
         check_info("state.db write-health probe skipped: store is held by a live writer and larger than 1 GB "
                    "(run 'hermes doctor --fix' to probe it)")
@@ -315,7 +324,7 @@ def _write_health_reason(state_db_path: Path, *, should_fix: bool):
                 dest.close()
         finally:
             src.close()
-        return _db_opens_cleanly(snapshot)
+        return _db_opens_cleanly(snapshot, integrity_budget_s=budget)
 
 
 # Corruption class -> (ok label, not-fixed label, failed issue, fix hint). ``{count}`` = recovered sessions.
