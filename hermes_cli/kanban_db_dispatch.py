@@ -1240,6 +1240,36 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
+_INFRA_WORKER_OUTPUT_MARKERS = (
+    "Gateway draining:",
+    "service_manager_unavailable",
+    "Gateway inaccessible:",
+    "Kanban execution unknown; retained by owner",
+)
+
+
+def _is_infrastructure_worker_loss(dead: _DeadWorker) -> bool:
+    """True when a dead worker reflects a host/gateway/resume interruption, not a task crash.
+
+    A worker lost to a gateway restart, an update drain, or an owner that cannot
+    resolve the outcome usually did real work before it died. Counting that as a
+    crash spends the card's failure budget and auto-blocks healthy cards after
+    two strikes; the reclaim already requeued the card, so the loss must leave
+    ``consecutive_failures`` untouched and let the card restart.
+    """
+    attempt_note = str(dead.event_payload.get("attempt_note") or "")
+    worker_out = str(dead.event_payload.get("worker_output") or "")
+    if any(m in worker_out for m in _INFRA_WORKER_OUTPUT_MARKERS):
+        return True
+    if "owner admission settled interrupted" in attempt_note:
+        return True
+    # Bare dead PID with no exit code, no worker output, and no worker_lost event
+    # (e.g. session resumed / host restarted and no worker exists on the PID).
+    if dead.kind == "unknown" and not worker_out and not dead.event_payload.get("worker_lost"):
+        return True
+    return False
+
+
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
@@ -1252,9 +1282,16 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
+        if _is_infrastructure_worker_loss(dead):
+            # Not a task crash: it must not make a card look systemic either.
+            continue
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
+        if _is_infrastructure_worker_loss(dead):
+            # Host/gateway/resume interruption: the reclaim already requeued the
+            # card, so leave consecutive_failures untouched and let it restart.
+            continue
         error_text = dead.error_text
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
