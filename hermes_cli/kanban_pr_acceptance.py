@@ -7,6 +7,34 @@ receipts only after rechecking the captured run/status/contract under its lock.
 login: :func:`_gh_env` resolves that profile's own credentials/config for the
 subprocess — a multi-profile host's default ``gh`` login cannot read another
 org's private repos (#122689).
+
+Repositories that declare NO required status checks
+---------------------------------------------------
+A repository can protect its base branch (required reviews, linear history,
+signed commits) while requiring zero status checks — ``erature-hub/aisuite``
+``main`` is exactly that: the protection object carries no
+``required_status_checks`` key and the repo publishes no ruleset. For such a
+repository the board must not invent a gate the repository never declared:
+the old code refused every completion with "No repository-required checks are
+configured", which no operator can act on once the contract is bound to a PR
+URL (publication binds once), so approved PR cards deadlocked forever.
+
+The zero-required path therefore verifies what the repository actually
+publishes about the head:
+
+* the PR must be landable (open, at the declared head, not conflicting);
+* when the head published verdicts, a verdict that is red on the head while
+  green on the base branch blocks, and the receipt names the check and the
+  cheapest disambiguation (re-run the job: a verdict a re-run clears was
+  runner noise, not a regression);
+* a verdict that is red on BOTH the head and the base branch is pre-existing
+  breakage (the base branch is red too) and is reported as an explicit
+  ``advisory`` acceptance instead of a permanent block;
+* when the head has published no verdict yet but CI is wired to it, the
+  receipt is ``pending`` (CI has not reported) — retryable, never a deadlock;
+* when no CI ran for this head at all, the receipt is an ``advisory``
+  acceptance: the repository runs no status checks for this PR, so there is
+  nothing to gate on and the deliverable is the published PR itself.
 """
 from __future__ import annotations
 
@@ -172,9 +200,6 @@ def collect_acceptance(contract: str, published_pr: str | None,
                     required.update((r["context"], r.get("integration_id"))
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
-        if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
-            return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
         runs = [run for page in pages for run in page["check_runs"]]
@@ -182,6 +207,14 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("Incomplete check-run pagination")
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
+        if not required:
+            # The repository declares no merge gate, so there is no policy to
+            # enforce. Verify the evidence the head actually published instead
+            # of refusing every completion (which deadlocked approved PR cards).
+            return _accept_without_required_checks(
+                receipt, repo=repo, number=number, sha=sha, branch=branch,
+                runs=runs, statuses=statuses, profile_home=profile_home,
+            )
         outcomes = []
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
@@ -227,3 +260,187 @@ def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
     if is_run and check.get("status") != "completed":
         return "pending"
     return {"success": "success", "failure": "failure", "error": "infra", "pending": "pending"}.get(outcome, "infra")
+
+
+#: A check-run verdict that is a genuine failure of the code under test.
+#: ``skipped``/``neutral`` are not failures: a check the repository gates
+#: conditionally (or a job that declined to run) says nothing about the PR.
+_FAILING_VERDICTS = frozenset({"failure", "timed_out", "action_required", "cancelled"})
+
+
+def _verdict_classification(conclusion: str | None) -> str:
+    """How one observed check reads in the receipt's evidence list.
+
+    A RED check must not be filed under the same label as a job that merely
+    declined to run. The receipt is the record an operator audits, and
+    "infra" reads as "not the PR's fault" - which is exactly the wrong
+    reading for the check the receipt is blocking on. "skipped" and
+    "neutral" are reported as themselves: a gated job that declined to run
+    says nothing about the PR, and neither is a failure.
+    """
+    if conclusion == "success":
+        return "success"
+    if conclusion in _FAILING_VERDICTS:
+        return "failure"
+    if conclusion in ("skipped", "neutral", "pending"):
+        return conclusion
+    return "infra"
+
+
+def _accept_without_required_checks(
+    receipt: dict, *, repo: str, number: int, sha: str, branch: str,
+    runs: list, statuses: list, profile_home: str | None,
+) -> dict:
+    """Acceptance for a repository that declares NO required status checks.
+
+    ``erature-hub/aisuite`` protects ``main`` (reviews, signed commits, linear
+    history) while requiring ZERO status checks and publishing no ruleset, so
+    ``required`` is empty. The old code answered that with
+    ``classification="missing"`` — a permanent refusal no operator could act
+    on once the contract was bound to a PR URL, which deadlocked approved PR
+    cards (``t_87ff3ac2``) in ``todo`` and let the auto-decomposer fan them
+    out into duplicate children.
+
+    The repository never declared a gate, so there is no policy to enforce.
+    What IS verifiable is the evidence the head published:
+
+    * the PR must be open (or merged), at the declared head and base, and must
+      not conflict with its base — an unmergeable PR is not a deliverable;
+    * a check-run that is red on the head while GREEN on the base branch is a
+      regression this PR introduced, and must block;
+    * a check-run that is red on the head AND red on the base branch is
+      pre-existing breakage (the base branch is red too), so it must not
+      deadlock the card — it is recorded as an advisory instead;
+    * a head that published no verdict yet while CI is wired to it is
+      ``pending`` (retryable), never a permanent refusal;
+    * a head with no CI at all is an advisory acceptance: the repository runs
+      no status checks for this PR, so the deliverable is the published PR.
+
+    Every receipt this returns names the checks it looked at and why the
+    verdict is what it is, so an operator can audit the decision.
+    """
+    receipt["required"] = []
+    head_checks: dict[str, dict] = {}
+    for run in runs:
+        if run.get("head_sha", run.get("sha")) != sha:
+            continue
+        head_checks[run["name"]] = run
+    legacy: dict[str, dict] = {}
+    for status in statuses:
+        if status.get("sha") != sha:
+            continue
+        legacy.setdefault(status.get("context"), status)
+
+    # The PR must be a landable deliverable: open (or merged), on the declared
+    # head and base. A conflicting PR cannot be merged, so it is not accepted
+    # even though the repository declares no checks.
+    current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
+    base_sha = ((current.get("base") or {}).get("sha")) or ""
+    if current.get("head", {}).get("sha") != sha or (current.get("base") or {}).get("ref") != branch:
+        receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
+        return receipt
+    # A conflicting PR cannot be merged, so it is not a deliverable even
+    # though the repository declares no checks. ``mergeable`` is null while
+    # GitHub recomputes it, so only an explicit False / "dirty" blocks.
+    if (current.get("state") == "closed" and not current.get("merged")) \
+            or current.get("mergeable") is False or current.get("mergeable_state") == "dirty":
+        receipt.update(
+            classification="conflict",
+            detail="PR is closed without being merged, or conflicts with its base branch; "
+                   "it is not a mergeable deliverable at this head.",
+        )
+        return receipt
+
+    observed: list[dict] = []
+    failing: list[str] = []
+    pending: list[str] = []
+    for name, run in sorted(head_checks.items()):
+        conclusion = run.get("conclusion")
+        if run.get("status") != "completed":
+            pending.append(name)
+            observed.append({"name": name, "id": run.get("id"), "classification": "pending",
+                             "conclusion": conclusion, "head_sha": run.get("head_sha")})
+            continue
+        if conclusion in _FAILING_VERDICTS:
+            failing.append(name)
+        observed.append({
+            "name": name, "id": run.get("id"),
+            "url": run.get("html_url"), "head_sha": run.get("head_sha"),
+            "classification": _verdict_classification(conclusion),
+            "conclusion": conclusion,
+        })
+    for context, status in sorted(legacy.items()):
+        if context in head_checks:
+            continue
+        state = status.get("state")
+        if state == "pending":
+            pending.append(context)
+        elif state == "failure":
+            failing.append(context)
+        observed.append({
+            "name": context, "id": status.get("id"), "url": status.get("target_url"),
+            "head_sha": status.get("sha"), "classification": _verdict_classification(state),
+            "conclusion": state,
+        })
+    receipt["checks"] = observed
+
+    if failing:
+        # Distinguish a regression from pre-existing breakage: a check that is
+        # also red on the base branch is not this PR's fault.
+        base_red = set()
+        if base_sha:
+            try:
+                base_pages = _api(f"repos/{repo}/commits/{base_sha}/check-runs?per_page=100&filter=latest",
+                                  paginate=True, profile_home=profile_home)
+            except (_GateAuthError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+                base_pages = []
+            for page in base_pages:
+                for run in page["check_runs"]:
+                    if run.get("head_sha") == base_sha and run.get("conclusion") in _FAILING_VERDICTS:
+                        base_red.add(run["name"])
+        regressions = sorted(name for name in failing if name not in base_red)
+        if regressions:
+            receipt.update(
+                classification="failure",
+                detail="Check(s) red on this PR's head but green on the base branch: "
+                       + ", ".join(regressions) + ". Re-run the job first - a verdict that a "
+                       "re-run clears was runner noise (host, timing or environment), not a "
+                       "regression; if it stays red, this PR introduced it and must be fixed "
+                       "or rebased onto the base.",
+            )
+            return receipt
+        receipt.update(
+            classification="advisory",
+            detail="Check(s) red on this PR's head are red on the base branch too ("
+                   + ", ".join(sorted(failing)) + "), so the breakage is pre-existing on "
+                   "the base branch and not introduced by this PR; accepting as advisory.",
+            ok=True,
+        )
+        return receipt
+
+    if pending:
+        receipt.update(
+            classification="pending",
+            detail="CI is wired to this PR's head but has not published every verdict yet "
+                   "(still reporting: " + ", ".join(sorted(pending)) + "); "
+                   "retry once the remaining checks report.",
+        )
+        return receipt
+
+    if not observed:
+        receipt.update(
+            classification="advisory",
+            detail="This repository declares no required status checks and published no "
+                   "check-run for this PR's head, so there is no CI evidence to verify; "
+                   "accepting as advisory on the published PR.",
+            ok=True,
+        )
+        return receipt
+
+    receipt.update(
+        classification="success",
+        detail="This repository declares no required status checks; verified that the "
+               "PR's head published no failing verdict (" + str(len(observed)) + " check(s) observed).",
+        ok=True,
+    )
+    return receipt

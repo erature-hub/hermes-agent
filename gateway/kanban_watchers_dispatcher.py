@@ -8,6 +8,7 @@ the singleton lock and the health telemetry; everything that only needs the
 from __future__ import annotations
 
 import contextlib
+import re
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
@@ -15,6 +16,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
+
+#: A card's completion contract bound to one exact GitHub pull request.
+_PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*")
 
 
 def _kbc():
@@ -271,11 +275,29 @@ class _KanbanDispatcher:
                     except Exception as exc:
                         logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
                         triage_ids = []
-                    for tid in triage_ids:
-                        if attempted >= auto_decompose_per_tick:
-                            break
-                        attempted += 1
-                        successes += self._decompose_one(_decomp, slug, tid)
+                    # The guard reads the SAME board the decomposer resolves
+                    # (no board kwarg, so the scoped slug decides), on one
+                    # connection for the whole board rather than one per card.
+                    with contextlib.ExitStack() as guard_stack:
+                        try:
+                            guard_conn = guard_stack.enter_context(_kbc().connect_closing())
+                        except Exception as exc:
+                            logger.debug("kanban auto-decompose: guard connect failed on board %s (%s)", slug, exc)
+                            guard_conn = None
+                        for tid in triage_ids:
+                            if attempted >= auto_decompose_per_tick:
+                                break
+                            # A blocked-on-capability card, or one whose PR is
+                            # already approved and awaiting merge, is finished or
+                            # human-gated work: decomposing it duplicates it.
+                            blocked = self._auto_decompose_blocked_reason(guard_conn, tid)
+                            if blocked:
+                                logger.info(
+                                    "kanban auto-decompose [%s]: %s not decomposed: %s", slug, tid, blocked,
+                                )
+                                continue
+                            attempted += 1
+                            successes += self._decompose_one(_decomp, slug, tid)
         return successes
 
     @staticmethod
@@ -295,6 +317,66 @@ class _KanbanDispatcher:
         else:
             logger.info("kanban auto-decompose [%s]: %s → single task (no fanout)", slug, tid)
         return 1
+
+    @staticmethod
+    def _auto_decompose_blocked_reason(conn: Optional[sqlite3.Connection], tid: str) -> Optional[str]:
+        """Why this triage card must not be auto-decomposed, or None to proceed.
+
+        The auto-decomposer fans a triage card out into a graph of children and
+        links the root under every child. Two card shapes make that destructive:
+
+        * a card blocked on a CAPABILITY wall (the block kind is a human/tool
+          gate, not a work item). Decomposing it multiplies the blocked card
+          into duplicate children that hit the same wall — the incident on
+          ``t_87ff3ac2``, whose six children all re-implemented work the
+          approved PR already contained;
+        * a card whose deliverable is an ALREADY-APPROVED PR. The PR is the
+          finished work; a fan-out would duplicate finished work instead of
+          tracking it, and the card is one completion away from done, not one
+          decomposition away.
+
+        The gate is read from the board, not from a GitHub call: the dispatch
+        tick must stay cheap and must not depend on GitHub being reachable.
+        The board-local proxy for "approved and awaiting merge" is: the card's
+        completion contract binds a pull-request URL, the card carries a
+        ``review_requested`` event, and no ``changes_requested`` event
+        contradicts it. The PR's own open/mergeable state is verified later,
+        at completion time, by the PR-acceptance gate
+        (``hermes_cli.kanban_pr_acceptance``) — which is where it belongs,
+        because that gate already has to talk to GitHub to publish a receipt.
+
+        A card that is not on this board is left to the decomposer (it decides
+        what to do with a row it cannot find); a board that cannot be read at
+        all blocks the fan-out, because guessing wrong re-opens the duplicate
+        hole this guard closes.
+        """
+        if conn is None:
+            return "could not read the board to decide whether this card is safe to decompose"
+        row = conn.execute(
+            "SELECT status, block_kind, completion_contract FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (row["block_kind"] or "") == "capability":
+            return "card is blocked on a capability wall (block_kind='capability')"
+        contract = row["completion_contract"] or ""
+        if not _PR_URL.fullmatch(contract):
+            return None
+        # A PR-bound card that already carries an approval (the review
+        # request was answered) and was not sent back for rework is finished
+        # work awaiting merge, not work to decompose. The PR's own open state
+        # is checked at completion time by the PR-acceptance gate.
+        approved = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'review_requested'",
+            (tid,),
+        ).fetchone()[0]
+        if approved and not conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
+            (tid,),
+        ).fetchone()[0]:
+            return f"card's PR ({contract}) was already approved and is awaiting merge"
+        return None
 
 
 @contextlib.contextmanager
