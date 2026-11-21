@@ -608,6 +608,16 @@ async def _spawn_registered_worker(authority, ref, row):
     generation = row.get('generation')
     try:
         env = await asyncio.to_thread(_worker_env, authority)
+        # A managed worker is spawned by the gateway, whose source was already synced at boot.
+        # hermes_bootstrap.prepare_launch() then relaunches a second interpreter to re-sync,
+        # doubling startup. That cost is variable (measured 0.4s-79s) and, when it exceeds the
+        # 60s HELLO_SECONDS hello budget, costs the worker the race -> managed_worker_hello_timeout.
+        # Skip the relaunch on the gateway-spawned worker path (the same short-circuit prepare_launch
+        # already honours): the worker's deps are current because the gateway synced them. Preserve the
+        # inherited/scrubbed env and just add the one var (env is None means "inherit parent env").
+        if env is None:
+            env = dict(os.environ)
+        env = {**env, "HERMES_DISABLE_LAZY_INSTALLS": "1"}
         cwd = (await asyncio.to_thread(Path(__file__).resolve)).parents[1]
         from gateway.session_worker_spawn import acquire_process
         from gateway.session_managed_worker_log import worker_log_path
