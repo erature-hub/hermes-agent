@@ -1466,32 +1466,79 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+def assign_task(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str],
+    *, holder: Optional[str] = None,
+) -> bool:
+    """Assign/reassign; raises RuntimeError while the task is HELD by a claim.
+
+    A card is HELD when ``claim_lock`` is set — whatever its ``status``
+    column says. The guard used to key on ``status='running'``, so a card
+    that had been moved back to ``ready`` while still holding its lock
+    looked free and ANY caller could take it over: the assignee was
+    rewritten, the original holder's lock and lease survived the takeover,
+    and when that lease expired the sweep requeued the card with
+    ``claim_lock = NULL`` — into the thief's dispatch lane, with the
+    original holder's worker still running it. The LOCK is the authority,
+    not the status column.
+
+    ``holder`` is the identity that already holds the lock. A holder may
+    re-affirm its OWN assignee (that is how a claim names the agent that
+    just took the card); it may not hand the card to anyone else.
+
+    The failure streak belongs to the CARD, not to the profile: it is the
+    circuit breaker that parks a card which keeps failing, and resetting it
+    on an assignee change let any caller launder a broken card back into
+    the dispatch lane. Only an explicit operator action
+    (:func:`reassign_task`, :func:`reclaim_task`, :func:`unblock_task`)
+    grants a fresh budget.
+
+    A refusal is AUDITED: an ``assignment_rejected`` event is committed
+    before the RuntimeError is raised, so the trail shows the attempt
+    instead of only the column it failed to change.
+    """
+    requested = profile
     profile = _canonical_assignee(profile)
+    rejection: Optional[dict] = None
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
-        if row["claim_lock"] is not None and row["status"] == "running":
-            raise RuntimeError(
-                f"cannot reassign {task_id}: currently running (claimed). "
-                "Wait for completion or reclaim the stale lock first."
-            )
-        if row["assignee"] != profile:
-            # The failure streak is per task/profile; a new profile starts fresh.
-            conn.execute(
-                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?", (profile, task_id),
-            )
+        lock = row["claim_lock"]
+        # The holder may re-affirm itself; nobody else may touch a held card.
+        holder_self = (
+            lock is not None
+            and holder is not None
+            and str(holder).strip().lower() == str(lock).strip().lower()
+            and str(requested or "").strip().lower() == str(holder).strip().lower()
+        )
+        if lock is not None and not holder_self:
+            rejection = {
+                "reason": "task_is_held",
+                "held_by": lock,
+                "requested": profile,
+                "current_assignee": row["assignee"],
+                "status": row["status"],
+            }
+            # Committed with this txn: the audit trail must show the attempt
+            # even though the write itself is refused.
+            _append_event(conn, task_id, "assignment_rejected", rejection)
         else:
+            # The failure streak is the CARD's breaker and survives an
+            # assignee change — see the docstring.
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
-        # a no-op re-assign or an unassign, which must not lift ``active_pr``.
-        _append_event(
-            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
+            # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
+            # a no-op re-assign or an unassign, which must not lift ``active_pr``.
+            _append_event(
+                conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
+            )
+    if rejection is not None:
+        raise RuntimeError(
+            f"cannot reassign {task_id}: held by {rejection['held_by']} "
+            f"(status={rejection['status']}). "
+            "Wait for completion or reclaim the stale lock first."
         )
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee",))
@@ -1998,8 +2045,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     counter check cannot see them — without this the trip is promoted back to
     ``ready`` in the same tick and the card respawns forever. A plain
     (unified-budget) ``gave_up`` carries no marker and is judged by the counter,
-    so raising ``failure_limit`` or ``assign_task`` to a fresh profile still
+    so raising ``failure_limit`` or an operator ``reassign_task`` still
     releases it; a task with no such event at all (direct DB edit) auto-recovers.
+    A plain ``assign_task`` does NOT release it any more: the streak is the
+    card's breaker, and an assignee change is not an operator decision.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
@@ -2574,18 +2623,32 @@ def reassign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, reclaim_first: bool = False,
     reason: Optional[str] = None,
 ) -> bool:
-    """Reassign (None unassigns); a running task is refused unless
-    ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
+    """Reassign (None unassigns); a HELD task is refused unless
+    ``reclaim_first`` releases its claim — the "this profile's model is
+    broken" path.
+
+    This is the OPERATOR reassign. A person deliberately re-routing a card
+    is not a takeover, so it grants a fresh retry budget
+    (:func:`_clear_failure_counter`) — the escape hatch that keeps the
+    breaker meaningful. The machine paths (:func:`assign_task`, which the
+    kanban bridge's ``update``/``claim`` ops call) never grant one: the
+    failure streak is the CARD's circuit breaker and must not be
+    launderable by a caller that can name any profile.
+    """
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
-    # assign_task handles its own txn + the still-running guard.
+    # assign_task handles its own txn + the held-card guard.
     try:
-        return assign_task(conn, task_id, profile)
+        ok = assign_task(conn, task_id, profile)
     except RuntimeError:
-        # Task is still running and reclaim_first was False; caller
+        # Task is still held and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
         return False
+    if ok:
+        # Operator intervention = fresh retry budget (own txn, after commit).
+        _clear_failure_counter(conn, task_id)
+    return ok
 
 
 def _verify_created_cards(

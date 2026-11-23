@@ -106,7 +106,12 @@ def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
 def test_plain_budget_trip_still_auto_recovers(kanban_home):
     """A unified-budget trip carries no ``sticky`` marker, so the two recovery paths on main
     survive: raising the dispatcher ``failure_limit`` past the counter promotes the card, and
-    ``assign_task`` to a fresh profile (counter reset by design) promotes it too."""
+    an OPERATOR reassign (fresh retry budget) promotes it too.
+
+    A plain ``assign_task`` does NOT promote it. The failure streak is the card's circuit
+    breaker, and an assignee change is not an operator decision: a machine path that can
+    name any profile must not be able to launder a broken card back into the dispatch lane.
+    """
     with kbc.connect() as conn:
         tids = [kb.create_task(conn, title=t, assignee="a") for t in ("raise-limit", "reassign")]
         for tid in tids:
@@ -127,7 +132,13 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
                 release_claim=False, end_run=False,
             )
         assert kb.get_task(conn, tids[1]).status == "blocked"
+        # Machine path: the streak survives the assignee change, so the card
+        # stays parked.
         kb.assign_task(conn, tids[1], "other-profile")
+        assert kb.recompute_ready(conn, failure_limit=2) == 0
+        assert kb.get_task(conn, tids[1]).status == "blocked"
+        # Operator path: an explicit reassign grants a fresh retry budget.
+        assert kb.reassign_task(conn, tids[1], "operator-profile") is True
         assert kb.recompute_ready(conn, failure_limit=2) == 1
         assert kb.get_task(conn, tids[1]).status == "ready"
 
