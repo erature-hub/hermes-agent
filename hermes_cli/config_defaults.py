@@ -1924,6 +1924,22 @@ DEFAULT_CONFIG = {
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
+        # Runtime ceiling for a card whose own max_runtime_seconds is unset. A card with no ceiling
+        # can hold its dispatch slot forever, so the default bounds it even when every other signal
+        # (heartbeat, worker log, CPU) looks healthy. The ceiling is stamped onto the card when it
+        # is claimed, so the bound is visible on the card. 0 = no ceiling (unbounded, as before).
+        "default_max_runtime_seconds": 14400,
+        # A running card whose worker has produced NO OUTPUT for this many seconds — its session
+        # transcript has not advanced AND its own log has not been written — is PARKED: alive,
+        # heartbeating, producing nothing. The dispatcher reclaims it (the heartbeat alone cannot
+        # tell it from a working worker, so it would hold its slot until a human stepped in).
+        # 0 = off. 60 minutes is above the longest silence a healthy worker can produce (the
+        # longest tool timeout is 30 minutes), so a worker mid-tool is never mistaken for a parked
+        # one.
+        "parked_worker_idle_seconds": 3600,
+        # How long the dispatcher watches a parked candidate's CPU time. ONE window per tick, shared
+        # by every candidate card.
+        "parked_worker_cpu_sample_seconds": 2.0,
         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.

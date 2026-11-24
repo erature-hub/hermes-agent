@@ -10,11 +10,16 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
+from gateway.kanban_watchers_common import (
+    _board_slugs,
+    _non_negative_int_setting,
+    _positive_int_setting,
+    logger,
+)
 
 
 def _kbc():
@@ -41,6 +46,13 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    # Defaults keep positional construction working for callers that predate
+    # these fields; the live values come from ``kanban.*`` at boot.
+    parked_idle_seconds: int = field(
+        default_factory=lambda: _kbd().PARKED_WORKER_IDLE_SECONDS)
+    parked_cpu_sample_seconds: float = field(
+        default_factory=lambda: _kbd().PARKED_WORKER_CPU_SAMPLE_SECONDS)
+    default_max_runtime_seconds: Optional[int] = None
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -101,6 +113,26 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
+    # Parked-worker reclaim. A worker that is alive and heartbeating but has
+    # produced no output and burned no CPU holds its dispatch slot until a
+    # human reclaims it; the dispatcher reclaims it instead. 0 = off.
+    parked_idle_seconds = _non_negative_int_setting(
+        kanban_cfg, "parked_worker_idle_seconds", _kbd().PARKED_WORKER_IDLE_SECONDS)
+    try:
+        parked_cpu_sample_seconds = float(
+            kanban_cfg.get("parked_worker_cpu_sample_seconds",
+                           _kbd().PARKED_WORKER_CPU_SAMPLE_SECONDS))
+    except (TypeError, ValueError):
+        logger.warning("kanban dispatcher: invalid kanban.parked_worker_cpu_sample_seconds=%r; "
+                       "using default %s", kanban_cfg.get("parked_worker_cpu_sample_seconds"),
+                       _kbd().PARKED_WORKER_CPU_SAMPLE_SECONDS)
+        parked_cpu_sample_seconds = _kbd().PARKED_WORKER_CPU_SAMPLE_SECONDS
+    if parked_cpu_sample_seconds < 0:
+        parked_cpu_sample_seconds = _kbd().PARKED_WORKER_CPU_SAMPLE_SECONDS
+    # Runtime ceiling for cards that carry none. 0 = unbounded (as before).
+    default_max_runtime_seconds = _non_negative_int_setting(
+        kanban_cfg, "default_max_runtime_seconds", None)
+
     return _DispatcherSettings(
         interval=interval,
         max_spawn=max_spawn,
@@ -114,6 +146,9 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        parked_idle_seconds=int(parked_idle_seconds or 0),
+        parked_cpu_sample_seconds=float(parked_cpu_sample_seconds),
+        default_max_runtime_seconds=default_max_runtime_seconds,
     )
 
 

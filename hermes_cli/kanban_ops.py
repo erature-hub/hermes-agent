@@ -78,9 +78,25 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = (
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
+        # Parked-worker reclaim + the runtime ceiling for cards that carry none.
+        # Same semantics as the gateway dispatch path.
+        parked_idle_seconds = kbd._positive_int(
+            _kanban_cfg.get("parked_worker_idle_seconds"),
+            kbd.PARKED_WORKER_IDLE_SECONDS, minimum=0,
+        )
+        parked_cpu_sample_seconds = float(
+            _kanban_cfg.get("parked_worker_cpu_sample_seconds")
+            or kbd.PARKED_WORKER_CPU_SAMPLE_SECONDS
+        )
+        default_max_runtime_seconds = kbd._positive_int(
+            _kanban_cfg.get("default_max_runtime_seconds"), 0, minimum=0,
+        )
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        parked_idle_seconds = kbd.PARKED_WORKER_IDLE_SECONDS
+        parked_cpu_sample_seconds = kbd.PARKED_WORKER_CPU_SAMPLE_SECONDS
+        default_max_runtime_seconds = 0
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
@@ -90,12 +106,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            parked_idle_seconds=parked_idle_seconds,
+            parked_cpu_sample_seconds=parked_cpu_sample_seconds,
+            default_max_runtime_seconds=default_max_runtime_seconds,
         )
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
                for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
-                         "reaped_terminal_workers")},
+                         "reaped_terminal_workers", "parked")},
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
             ],
@@ -113,6 +132,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "spawn_suppressed": [
+                {"reason": key, "detail": text} for (key, text) in res.spawn_suppressed
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -122,6 +144,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         ("Crashed:     ", res.crashed),
         ("Timed out:   ", res.timed_out),
         ("Stale:       ", res.stale),
+        ("Parked:      ", res.parked),
         ("Auto-blocked:", res.auto_blocked),
     ):
         print(f"{label} {len(items)}")
@@ -132,6 +155,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    # Say WHY nothing was spawned. Without this the operator reads "spawned 0"
+    # with every skip list empty — the signature of a board that is full of
+    # workers doing nothing.
+    for reason_key, text in res.spawn_suppressed:
+        print(f"Not spawned [{reason_key}]: {text}")
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
@@ -191,6 +219,24 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             print(f"warning: could not write pidfile {pidfile}: {exc}", file=sys.stderr)
 
     verbose = bool(getattr(args, "verbose", False))
+    # Same settings as the gateway dispatch path, so the standalone daemon is
+    # not the one uncapped (or un-reclaimed) entry point.
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        parked_idle_seconds = kbd._positive_int(
+            _kanban_cfg.get("parked_worker_idle_seconds"),
+            kbd.PARKED_WORKER_IDLE_SECONDS, minimum=0)
+        parked_cpu_sample_seconds = float(
+            _kanban_cfg.get("parked_worker_cpu_sample_seconds")
+            or kbd.PARKED_WORKER_CPU_SAMPLE_SECONDS)
+        default_max_runtime_seconds = kbd._positive_int(
+            _kanban_cfg.get("default_max_runtime_seconds"), 0, minimum=0)
+    except Exception:
+        parked_idle_seconds = kbd.PARKED_WORKER_IDLE_SECONDS
+        parked_cpu_sample_seconds = kbd.PARKED_WORKER_CPU_SAMPLE_SECONDS
+        default_max_runtime_seconds = 0
     print(
         f"Kanban dispatcher running STANDALONE via --force (interval={args.interval}s, "
         f"pid={os.getpid()}). Ctrl-C to stop. NOTE: if a gateway is also running with "
@@ -238,12 +284,13 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
-            or res.spawned or res.auto_blocked or res.stale
+            or res.spawned or res.auto_blocked or res.stale or res.parked,
         )
         if did_work:
             print(
                 f"[{_fmt_ts(int(time.time()))}] reclaimed={res.reclaimed} "
                 f"crashed={len(res.crashed)} timed_out={len(res.timed_out)} stale={len(res.stale)} "
+                f"parked={len(res.parked)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
                 f"auto_blocked={len(res.auto_blocked)}",
                 flush=True,
@@ -254,6 +301,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             interval=args.interval,
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            parked_idle_seconds=parked_idle_seconds,
+            parked_cpu_sample_seconds=parked_cpu_sample_seconds,
+            default_max_runtime_seconds=default_max_runtime_seconds,
             on_tick=_on_tick,
         )
     finally:
