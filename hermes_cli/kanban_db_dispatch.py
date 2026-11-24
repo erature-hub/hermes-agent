@@ -156,6 +156,16 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    parked: list[str] = field(default_factory=list)
+    """Task ids reclaimed because their worker was PARKED — alive and
+    heartbeating, but producing no output, so it held its dispatch slot
+    forever. See :func:`detect_parked_workers`."""
+    spawn_suppressed: list[tuple[str, str]] = field(default_factory=list)
+    """``(reason_key, human_text)`` for every TICK-LEVEL hold that stopped this
+    tick from spawning: the live concurrency caps (``max_spawn`` /
+    ``max_in_progress``) and memory pressure. Without these the operator sees
+    "spawned 0" with every skip list empty — the signature of a board that is
+    full of workers doing nothing."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -181,6 +191,13 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        # Tick-level holds (the live concurrency caps). Without these the
+        # "dispatcher stuck" warning names a bare zero-spawn count while the
+        # real reason — the board is full of RUNNING workers — goes unsaid.
+        for reason_key, _text in res.spawn_suppressed:
+            counts[reason_key] = counts.get(reason_key, 0) + 1
+        if res.parked:
+            counts["parked_reclaimed"] = counts.get("parked_reclaimed", 0) + len(res.parked)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
@@ -653,17 +670,26 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+def enforce_max_runtime(
+    conn: sqlite3.Connection, *, default_seconds: Optional[int] = None, signal_fn=None
+) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
     task's source phase so the next tick re-spawns the same kind of worker —
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+
+    ``default_seconds`` is the fleet-wide ceiling for cards whose own
+    ``max_runtime_seconds`` is unset. A card with no ceiling is a card that can
+    hold its dispatch slot forever, so the default bounds it even when every
+    other signal (heartbeat, log, CPU) looks healthy. Cards that carry their
+    own ceiling keep it — the default only fills the gap.
     """
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = _kb._host_prefix()
+    default_limit = int(default_seconds) if default_seconds and int(default_seconds) > 0 else None
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, "
@@ -671,9 +697,11 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status = 'running' "
+        "  AND (t.max_runtime_seconds IS NOT NULL OR ? IS NOT NULL) "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
+        "  AND t.worker_pid IS NOT NULL",
+        (default_limit,),
     ).fetchall()
     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
     for row in rows:
@@ -685,7 +713,13 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
         # so retries must be measured from the active task_runs row.
         elapsed = now - (_kb._to_epoch(row["active_started_at"]) or now)  # unreadable clock: never kill
-        limit = int(row["max_runtime_seconds"])
+        limit = (
+            int(row["max_runtime_seconds"])
+            if row["max_runtime_seconds"] is not None
+            else default_limit
+        )
+        if limit is None:
+            continue
         if elapsed < limit:
             continue
 
@@ -858,6 +892,195 @@ def detect_stale_running(
                 metadata=payload,
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
+            reclaimed.append(tid)
+
+    return reclaimed
+
+
+# A worker that has produced NO OUTPUT for this long is PARKED: alive,
+# heartbeating, and holding its dispatch slot forever.
+#
+# The DECISION is made by the worker's TRANSCRIPT (when its session last wrote
+# a message); the log is the second gate, and both must be quiet. The worker's
+# stdout is block-buffered (a file handle, not a tty), so the log UNDER-reports
+# output — a healthy worker was measured with a log 51 minutes stale while its
+# transcript grew every few seconds. The log alone would be an unsafe gate.
+#
+# 60 minutes is above the longest silence a healthy worker can produce (the
+# longest tool timeout is 30 minutes), so a worker mid-tool is never mistaken
+# for a parked one.
+PARKED_WORKER_IDLE_SECONDS = 60 * 60
+
+# How long to watch the worker's CPU time. ONE window per tick, shared by
+# every candidate card — never one window per card.
+PARKED_WORKER_CPU_SAMPLE_SECONDS = 2.0
+
+# CPU seconds over that window above which the process counts as doing work.
+# Windows clock ticks are 15.6 ms, so 0.25 s is ~16 ticks. This is a VETO, not
+# a requirement: cross-process CPU accounting is not available on every host
+# (measured: a child spinning at 100% reads back 0.00 CPU seconds here through
+# both psutil and GetProcessTimes), and an unmeasurable gate must never be
+# treated as a gate that was passed.
+PARKED_WORKER_CPU_MIN_SECONDS = 0.25
+
+
+def detect_parked_workers(
+    conn: sqlite3.Connection,
+    *,
+    idle_seconds: int = PARKED_WORKER_IDLE_SECONDS,
+    cpu_sample_seconds: float = PARKED_WORKER_CPU_SAMPLE_SECONDS,
+    cpu_min_seconds: float = PARKED_WORKER_CPU_MIN_SECONDS,
+    board: Optional[str] = None,
+    signal_fn=None,
+) -> list[str]:
+    """Reclaim running cards whose worker is alive but not progressing.
+
+    A card is PARKED when its worker produced NO OUTPUT for ``idle_seconds``:
+    its session transcript has not advanced (the last message is older than the
+    threshold) AND its own log has not been written either. The transcript is
+    the decision — every tool call and every reply appends to it, so a working
+    worker advances it continuously — and the log is the second gate.
+
+    CPU is a VETO, never a requirement: a worker that is visibly burning cycles
+    is not reclaimed whatever the other signals say, and a host that cannot
+    measure a child's CPU time (this one cannot: a child spinning at 100%
+    reads back 0.00 CPU seconds through both psutil and GetProcessTimes) falls
+    back to the transcript and log gates alone rather than never reclaiming.
+
+    The heartbeat cannot make this call. ``agent.activity_tracking`` bridges
+    chunk-level activity into ``last_heartbeat_at`` every 60 s, so a worker
+    parked mid-turn — waiting on a provider response that never arrives — keeps
+    a FRESH heartbeat and is indistinguishable from a working one. The reclaim
+    closes the run as ``parked``, releases the claim and returns the card to
+    its source phase, so the freed slot goes to the next highest-priority
+    ready card on this very tick: the card with real work stops waiting behind
+    a worker that will never do any.
+
+    A worker the dispatcher cannot MEASURE is never reclaimed here. No session
+    id, no readable transcript or no readable log means "unknown", and unknown
+    is never "idle".
+
+    Deliberately NOT counted through ``_record_task_failure``: a parked worker
+    is an infrastructure hang, not the card's fault, and charging it would let
+    a fleet-wide hang trip the breaker and block healthy cards (the same
+    reasoning as :func:`detect_stale_running`).
+    """
+    if idle_seconds <= 0:
+        return []
+
+    from hermes_cli import kanban_worker_liveness as _liveness
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
+
+    now = int(time.time())
+    host_prefix = _kb._host_prefix()
+    reclaimed: list[str] = []
+
+    rows = conn.execute(
+        "SELECT t.id, t.assignee, t.worker_pid, t.worker_started_at, "
+        "       t.last_heartbeat_at, t.claim_lock "
+        "FROM tasks t "
+        "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
+    ).fetchall()
+
+    # Cheap gates first: a worker whose transcript or log moved recently is
+    # producing output and needs no CPU sample at all.
+    candidates: list[tuple[sqlite3.Row, float, float, str]] = []
+    for row in rows:
+        if owner_reclaim_blocked(conn, row["id"]):
+            continue
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue  # another host's worker: its pid means nothing here
+        log_idle = _liveness.worker_log_idle_seconds(row["id"], board=board)
+        if log_idle is None or log_idle < idle_seconds:
+            continue
+        session_id = _liveness.newest_worker_session_id(row["id"], board=board)
+        if not session_id:
+            continue
+        progress = _liveness.worker_transcript_progress(row["assignee"], session_id)
+        if progress is None:
+            continue
+        transcript_idle = progress.idle_seconds(now)
+        if transcript_idle < idle_seconds:
+            continue
+        candidates.append((row, log_idle, transcript_idle, session_id))
+    if not candidates:
+        return []
+
+    # One CPU window for every candidate at once.
+    deltas = _liveness.sample_cpu_deltas(
+        [row["worker_pid"] for row, _log, _transcript, _sid in candidates],
+        cpu_sample_seconds,
+    )
+
+    for row, log_idle, transcript_idle, session_id in candidates:
+        pid = row["worker_pid"]
+        tid = row["id"]
+        lock = row["claim_lock"] or ""
+        cpu_delta = deltas.get(int(pid))
+        if cpu_delta is not None and cpu_delta >= cpu_min_seconds:
+            continue  # burning cycles -> working, not parked
+
+        termination = _kb._terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn,
+            started_at=_kb._row_get(row, "worker_started_at"),
+        )
+
+        # Never release a claim while our own worker is still alive: that would
+        # spawn a duplicate beside it. Hold the claim and retry next tick.
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now, termination,
+                reason="parked_worker_alive",
+            )
+            continue
+
+        with _kb.write_txn(conn):
+            # Again under the write lock, after the termination wait.
+            if owner_reclaim_blocked_after_kill(
+                conn, tid, signalled=bool(termination.get("termination_attempted"))
+            ):
+                continue
+            retry_status = _kb._retry_status_for_run(conn, tid)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' "
+                "  AND claim_lock IS ?",
+                (retry_status, tid, row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+
+            payload = {
+                "transcript_idle_seconds": int(transcript_idle),
+                "log_idle_seconds": int(log_idle),
+                "idle_threshold_seconds": int(idle_seconds),
+                "session_id": session_id,
+                # None = the host cannot measure another process's CPU time; the
+                # veto is then simply not available, and the transcript and log
+                # gates carried the decision on their own.
+                "cpu_delta_seconds": (
+                    round(float(cpu_delta), 4) if cpu_delta is not None else None
+                ),
+                "cpu_sample_seconds": float(cpu_sample_seconds),
+                "cpu_min_seconds": float(cpu_min_seconds),
+                "pid": int(pid) if pid else None,
+                "retry_status": retry_status,
+            }
+            payload.update(termination)
+
+            run_id = _kb._end_run(
+                conn, tid,
+                outcome="parked", status="parked",
+                error=(
+                    f"worker parked: no output for {int(transcript_idle)}s "
+                    f"(transcript) / {int(log_idle)}s (log)"
+                ),
+                metadata=payload,
+            )
+            _kb._append_event(conn, tid, "parked", payload, run_id=run_id)
             reclaimed.append(tid)
 
     return reclaimed
@@ -1999,6 +2222,9 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    parked_idle_seconds: int = PARKED_WORKER_IDLE_SECONDS,
+    parked_cpu_sample_seconds: float = PARKED_WORKER_CPU_SAMPLE_SECONDS,
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2007,6 +2233,11 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    ``parked_idle_seconds`` / ``parked_cpu_sample_seconds`` tune the parked-worker
+    reclaim (:func:`detect_parked_workers`); ``0`` disables it.
+    ``default_max_runtime_seconds`` is the runtime ceiling applied to cards that
+    carry no ceiling of their own.
     """
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
@@ -2022,6 +2253,9 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            parked_idle_seconds=parked_idle_seconds,
+            parked_cpu_sample_seconds=parked_cpu_sample_seconds,
+            default_max_runtime_seconds=default_max_runtime_seconds,
         )
 
     try:
@@ -2125,6 +2359,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2204,6 +2439,19 @@ def _dispatch_lane_task(
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+    # Stamp the fleet-wide runtime ceiling onto a card that carries none, so the
+    # bound is visible on the card and enforced from the FIRST attempt — a card
+    # with no ceiling can hold its dispatch slot forever.
+    if default_max_runtime_seconds and int(default_max_runtime_seconds) > 0:
+        try:
+            with _kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET max_runtime_seconds = ? "
+                    "WHERE id = ? AND max_runtime_seconds IS NULL",
+                    (int(default_max_runtime_seconds), claimed.id),
+                )
+        except Exception:
+            pass
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
@@ -2276,6 +2524,9 @@ def _run_reclaim_phase(
     stale_timeout_seconds: int,
     failure_limit: int,
     reconcile_orphans: bool,
+    parked_idle_seconds: int = PARKED_WORKER_IDLE_SECONDS,
+    parked_cpu_sample_seconds: float = PARKED_WORKER_CPU_SAMPLE_SECONDS,
+    default_max_runtime_seconds: Optional[int] = None,
     board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
@@ -2285,12 +2536,21 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
+    # Parked workers: alive, heartbeating, producing nothing. They hold their
+    # dispatch slot until a human reclaims them, so the dispatcher does it here
+    # — the freed slot goes to the next ready card on THIS tick.
+    result.parked = detect_parked_workers(
+        conn,
+        idle_seconds=parked_idle_seconds,
+        cpu_sample_seconds=parked_cpu_sample_seconds,
+        board=board,
+    )
     result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(conn, default_seconds=default_max_runtime_seconds)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2321,12 +2581,26 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            # ``max_spawn`` is a LIVE concurrency cap (running + this tick's
+            # spawns), not a per-tick budget. Say so, or the operator reads a
+            # bare "spawned 0" and cannot tell a full board from a broken one.
+            result.spawn_suppressed.append((
+                "max_spawn_cap",
+                f"max_spawn concurrency cap {max_spawn} reached "
+                f"({running_count} running) — it is a LIVE concurrency cap, "
+                f"not a per-tick budget",
+            ))
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.spawn_suppressed.append((
+                "max_in_progress_cap",
+                f"max_in_progress host cap {max_in_progress} reached "
+                f"({total_running} running across boards)",
+            ))
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -2428,6 +2702,9 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    parked_idle_seconds: int = PARKED_WORKER_IDLE_SECONDS,
+    parked_cpu_sample_seconds: float = PARKED_WORKER_CPU_SAMPLE_SECONDS,
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2437,7 +2714,11 @@ def _dispatch_once_locked(
     result = DispatchResult()
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
-        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
+        parked_idle_seconds=parked_idle_seconds,
+        parked_cpu_sample_seconds=parked_cpu_sample_seconds,
+        default_max_runtime_seconds=default_max_runtime_seconds,
+        board=board,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
@@ -2489,6 +2770,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        default_max_runtime_seconds=default_max_runtime_seconds,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2975,6 +3257,9 @@ def run_daemon(
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    parked_idle_seconds: int = PARKED_WORKER_IDLE_SECONDS,
+    parked_cpu_sample_seconds: float = PARKED_WORKER_CPU_SAMPLE_SECONDS,
+    default_max_runtime_seconds: Optional[int] = None,
     stop_event=None,
     on_tick=None,
 ) -> None:
@@ -3014,6 +3299,9 @@ def run_daemon(
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    parked_idle_seconds=parked_idle_seconds,
+                    parked_cpu_sample_seconds=parked_cpu_sample_seconds,
+                    default_max_runtime_seconds=default_max_runtime_seconds,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):

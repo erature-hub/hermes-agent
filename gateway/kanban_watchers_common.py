@@ -63,6 +63,30 @@ def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
     return value
 
 
+def _non_negative_int_setting(
+    kanban_cfg: dict, key: str, default: Optional[int] = None
+) -> Optional[int]:
+    """Parse an optional ``kanban.<key>`` int where 0 is a MEANINGFUL value.
+
+    ``_positive_int_setting`` treats 0 as invalid. These settings use 0 to mean
+    "off" (no runtime ceiling, no parked-worker reclaim), so 0 must survive
+    parsing — and an unset key falls back to ``default`` rather than to None.
+    """
+    raw = kanban_cfg.get(key)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("kanban dispatcher: invalid kanban.%s=%r; using default %s", key, raw, default)
+        return default
+    if value < 0:
+        logger.warning("kanban dispatcher: kanban.%s=%r is negative; using default %s", key, raw, default)
+        return default
+    logger.info("kanban dispatcher: %s=%d", key, value)
+    return value
+
+
 def _resolve_auto_decompose_settings(load_config: Callable[[], Any]) -> tuple[bool, int]:
     """Live (enabled, per_tick) auto-decompose settings, re-read every dispatcher tick.
 
