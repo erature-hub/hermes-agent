@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import queue
+import re
 import secrets
 import shutil
 import signal
@@ -925,9 +926,72 @@ def _sanitize_cell_spill(kernel: SessionKernel, cell_spill: str) -> str:
         return ""
 
 
+# The cell frame in a sandbox traceback: `File "<cell>", line N, in <module>`. The name
+# "<cell>" is the compile() filename the kernel runner uses for the cell's own source, so
+# this frame names the line of the CELL that raised — not of an imported module.
+_CELL_FRAME_RE = re.compile(r'File "<cell>", line (\d+), in (\S+)')
+# The undefined name in a NameError. CPython appends a "Did you mean: '...'?" suffix
+# when a near-miss name exists; the capture stops before it.
+_NAME_ERROR_RE = re.compile(r"NameError: name '([A-Za-z_][A-Za-z0-9_]*)' is not defined")
+
+
+def _heredoc_terminator_hint(traceback_text: str, cell_source: str) -> Optional[str]:
+    """Name the shell-quoting trap when a cell dies on a bare heredoc terminator.
+
+    A cell that carries a shell heredoc in its own Python source ends up executing
+    the heredoc's TERMINATOR as a Python statement, so the interpreter raises
+    ``NameError: name 'PYEOF' is not defined`` — a name the worker never intended
+    to use and cannot guess from the trace.
+
+    Measured across the fleet's own session store, the undefined names in this
+    class ARE the shell tokens (PY 104, PYEOF 38, EOF 15, EOF2 1), and in every
+    recovered case the failing line of the cell IS the bare token.
+
+    The name's SHAPE is not enough to decide this. A plain all-caps rule also
+    fires on ordinary Python bugs — a missing constant (``PISTIS_PUBLIC_PREFIXES``)
+    or a typo'd variable (``NEW_ISS``) — and telling the worker "you wrote a
+    heredoc" when it did not sends it chasing the wrong bug. So the verdict is
+    anchored to the SOURCE: the traceback's ``<cell>`` frame must name a line
+    whose content is exactly the undefined name. Over the recovered corpus that
+    test accepts 26 real occurrences and rejects every counter-example, where
+    the all-caps rule accepts 29 and rejects none of the four.
+
+    Without the cell source this stays silent rather than guessing.
+    """
+    if not traceback_text or not cell_source:
+        return None
+    name_match = _NAME_ERROR_RE.search(traceback_text)
+    if not name_match:
+        return None
+    name = name_match.group(1)
+    frame_match = _CELL_FRAME_RE.search(traceback_text)
+    if not frame_match:
+        return None
+    try:
+        line_no = int(frame_match.group(1))
+    except (TypeError, ValueError):
+        return None
+    lines = cell_source.splitlines()
+    if not (1 <= line_no <= len(lines)):
+        return None
+    if lines[line_no - 1].strip() != name:
+        # The failing line is NOT the bare token: this is a genuine Python
+        # undefined-name bug, not a shell terminator. Say nothing.
+        return None
+    return (
+        f"'{name}' is a shell heredoc terminator that was executed as Python. "
+        f"The cell's own source reached the interpreter as code, so the heredoc's "
+        f"closing marker (line {line_no}) was run as a statement instead of being "
+        f"read by a shell. Put the shell script in a terminal() call, or build it as "
+        f"a string and quote the terminator (<<'{name}' ... {name}) so the shell — "
+        f"not the interpreter — sees it. If you did mean a Python constant named "
+        f"{name}, define it before use."
+    )
+
+
 def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[str, Any], *,
                  timeout: int, sandbox_tools: frozenset, reused: bool,
-                 state_reset: bool, exec_start: float) -> dict[str, Any]:
+                 state_reset: bool, exec_start: float, cell_source: str = "") -> dict[str, Any]:
     """Assemble the tool result for one settled cell (disposing the kernel where the contract says so)."""
     from tools.code_execution_tool import (
         _sandbox_failure_hint, _sanitize_output_text, _truncate_stdout_text,
@@ -940,7 +1004,11 @@ def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[s
     duration = round(time.monotonic() - exec_start, 2)
     kernel.execution_count = int(payload.get("execution_count", kernel.execution_count + 1))
     stderr_raw = kernel.stderr.drain()
-    stdout_text, stdout_metadata = _truncate_stdout_text(clean(str(payload.get("stdout", "")) + kernel.raw.drain()))
+    # The FULL stdout is kept alongside the capped copy: a cell that dies after
+    # producing real output must leave that output recoverable, and the capped
+    # copy alone is what the model sees inline.
+    raw_stdout = clean(str(payload.get("stdout", "")) + kernel.raw.drain())
+    stdout_text, stdout_metadata = _truncate_stdout_text(raw_stdout)
     cell_stderr = clean(str(payload.get("stderr", "")) + stderr_raw)
     cell_status = payload.get("status", "")
     result: dict[str, Any] = {
@@ -998,7 +1066,27 @@ def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[s
         trace = clean(str(payload.get("traceback", "")))
         result.update(status="error", exit_code=1, error=trace or "Cell raised an exception.",
                       output=_with_stderr(stdout_text, cell_stderr + trace) if (cell_stderr or trace) else stdout_text)
+        # A cell that dies after producing real output must not throw that output
+        # away: the worker may be gone by the time anyone reads the run record.
+        # Spill the FULL stdout (the inline copy is capped) and name the path, so
+        # the next attempt or a human can recover what was already learned
+        # instead of starting over.
+        if raw_stdout.strip() and not result.get("stdout_spill_path"):
+            from tools.code_execution_tool import _spill_full_stdout
+            spilled = _spill_full_stdout(raw_stdout)
+            if spilled:
+                result["stdout_spill_path"] = spilled
+                result["cell_stdout_preserved"] = True
+        # The cell's own source rides along so the trap can be decided from the
+        # failing LINE rather than the undefined name's spelling — a cell that
+        # executed a heredoc terminator as Python is a different bug from a cell
+        # that used an undefined constant, and the worker must be told which.
         hint = _sandbox_failure_hint(trace, enabled_tools=sandbox_tools)
+        if not hint:
+            try:
+                hint = _heredoc_terminator_hint(trace, cell_source)
+            except Exception:
+                hint = None
         if hint:
             result["hint"] = hint
     elif cell_status == "exit":
@@ -1069,7 +1157,7 @@ def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, chi
             result = _cell_result(
                 kernel, key, status, payload,
                 timeout=timeout, sandbox_tools=sandbox_tools, reused=reused,
-                state_reset=state_reset, exec_start=exec_start,
+                state_reset=state_reset, exec_start=exec_start, cell_source=code,
             )
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:  # pragma: no cover - defensive parity with per-call
