@@ -157,6 +157,32 @@ def _missing_hermes_tools_import_hint(m, enabled_tools) -> str:
             "else, use the normal tool call instead of execute_code.")
 
 
+def _heredoc_terminator_hint(m, _enabled_tools) -> str:
+    """Name the heredoc-quoting trap when a SHELL token is undefined in Python.
+
+    A cell that carries a shell heredoc in its own Python source executes the
+    heredoc's TERMINATOR as a Python statement, so the interpreter raises
+    ``NameError: name 'PYEOF' is not defined`` — a name the worker never
+    intended to use and cannot guess. Measured across the fleet's own session
+    store, the undefined names in this class are the shell tokens themselves:
+    ``PYEOF`` (32), ``PY`` (15), ``DB_PATH`` (9), ``EOF`` (5).
+
+    The shape is an ALL-CAPS token, so the rule is deliberately narrow: a
+    lower-case undefined name is a different mistake and keeps its own hint.
+    """
+    name = m.group(1)
+    return (
+        f"'{name}' is a SHELL token that leaked into Python — a heredoc "
+        f"terminator (PYEOF / EOF / PY) or an environment-variable name, not a "
+        f"Python name. This is the heredoc-quoting trap: the shell block was "
+        f"written inside the cell's Python source, so its terminator line was "
+        f"executed as Python. Put the shell script in a terminal() call, or build "
+        f"it as a string and quote the terminator (<<'PYEOF' ... PYEOF) so the "
+        f"shell — not the interpreter — sees it. If you did mean a Python "
+        f"constant, define {name}."
+    )
+
+
 # (regex, formatter(match, enabled_tools)) — first match wins. Production mining (state.db) ranked
 # these as the top execute_code failure classes: hermes_tools import misuse, missing helper
 # imports, treating tool results as strings, importing third-party packages absent from the sandbox.
@@ -165,6 +191,7 @@ _FAILURE_HINT_RULES = (
     (r"NameError: name '(json_parse|shell_quote|retry)' is not defined",
      lambda m, _: f"Import {m.group(1)} before calling it: "
                   f"from hermes_tools import {m.group(1)}"),
+    (r"NameError: name '([A-Z][A-Z0-9_]+)' is not defined", _heredoc_terminator_hint),
     (r"ModuleNotFoundError: No module named '([\w.]+)'",
      lambda m, _: f"'{m.group(1)}' is not installed in the sandbox interpreter. "
                   "Use Python stdlib inside execute_code, or run the code via "
