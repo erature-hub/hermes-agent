@@ -117,6 +117,57 @@ class TestReconcileOrphanedRunning:
             "SELECT status FROM tasks WHERE id=?", (tid,)
         ).fetchone()["status"] == "running"
 
+    def test_orphan_with_unfinished_parent_lands_in_todo(self, conn):
+        """An orphan whose parent has NOT finished must not re-enter the
+        dispatch lane.
+
+        ``ready`` IS the dispatch lane, so requeuing a dependency-blocked
+        card there puts it straight back in front of a worker, which claims
+        it, is refused by the dependency gate, and writes another
+        ``claim_rejected`` event — the churn this pass exists to end. The
+        board parks such a card in ``todo`` (that is exactly what
+        ``claim_task`` demotes it to), and ``recompute_ready`` promotes it
+        when the parent lands.
+        """
+        parent = kb.create_task(conn, title="parent", assignee="w")
+        child = kb.create_task(conn, title="child", assignee="w",
+                               parents=(parent,))
+        # The child starts in 'todo': its parent is not done.
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (child,)
+        ).fetchone()["status"] == "todo"
+        _orphan_running(conn, child)
+
+        reconciled = kbd.reconcile_orphaned_running(conn)
+
+        assert reconciled == [child]
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires FROM tasks WHERE id=?",
+            (child,),
+        ).fetchone()
+        assert row["status"] == "todo"
+        assert row["claim_lock"] is None
+        assert row["claim_expires"] is None
+
+    def test_orphan_with_finished_parent_lands_in_ready(self, conn):
+        """An orphan whose parents are all terminal may re-enter the lane.
+
+        The landing status is the dependency gate's answer, not a constant:
+        ``ready`` when every parent is done, ``todo`` otherwise.
+        """
+        parent = kb.create_task(conn, title="parent", assignee="w")
+        child = kb.create_task(conn, title="child", assignee="w",
+                               parents=(parent,))
+        kb.complete_task(conn, parent, summary="parent done")
+        _orphan_running(conn, child)
+
+        reconciled = kbd.reconcile_orphaned_running(conn)
+
+        assert reconciled == [child]
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (child,)
+        ).fetchone()["status"] == "ready"
+
     def test_live_worker_pid_defers_reconcile(self, conn):
         """If the orphan row still records a live PID on this host, don't
         requeue beside a possibly-alive worker — defer to the next tick."""
