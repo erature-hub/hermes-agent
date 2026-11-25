@@ -872,6 +872,15 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     pid, ``detect_stale_running`` is off by default. Orphans go back to ``ready``
     with a comment, leaked run closed, ``reconciled`` event; a row with a live
     host-local PID is deferred so no duplicate spawns beside it.
+
+    An orphan whose PARENTS are unfinished lands in ``todo``, not ``ready``:
+    ``ready`` is the dispatch lane, so requeuing a dependency-blocked card
+    there puts it straight back in front of a worker, which claims it, is
+    refused by the dependency gate, and writes another ``claim_rejected``
+    event — the churn this reconciliation exists to end. ``todo`` is where
+    the board itself parks a card whose parents have not finished (that is
+    exactly what ``claim_task`` demotes it to), and ``recompute_ready``
+    promotes it when the parents land.
     """
     now = int(time.time())
     reconciled: list[str] = []
@@ -896,18 +905,27 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
         with _kb.write_txn(conn):
             if owner_reclaim_blocked(conn, tid):
                 continue
+            # The dependency gate decides where an orphan lands: ``ready`` when
+            # every parent is terminal (the dispatch lane may take it), ``todo``
+            # when a parent is still open (the board parks it there — exactly
+            # what ``claim_task`` demotes a refused claim to). Requeuing a
+            # dependency-blocked card to ``ready`` sends it straight back into
+            # the dispatch lane, where a worker claims it, is refused by the
+            # gate, and the card churns there every tick.
+            landing_status = _kb._landing_status_after_parents(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                (landing_status, tid, row["claim_lock"], row["claim_expires"]),
             )
             if cur.rowcount != 1:
                 continue
             payload = {
                 "reason": "orphaned_running",
+                "status": landing_status,
                 "claim_lock": row["claim_lock"],
                 "claim_expires": _kb._to_epoch(row["claim_expires"]),
                 "worker_pid": int(pid) if pid else None,
@@ -922,14 +940,15 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             _kb._insert_comment(
                 conn, tid, "dispatcher",
                 "reconciliation: card was 'running' with no valid claim "
-                "(dead/gone worker) — requeued to ready",
+                f"(dead/gone worker) — requeued to {landing_status}",
                 now,
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
             reconciled.append(tid)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
-            "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
+            "(claim_lock=%r, worker_pid=%r, status=%s)",
+            tid, row["claim_lock"], pid, landing_status,
         )
     return reconciled
 
