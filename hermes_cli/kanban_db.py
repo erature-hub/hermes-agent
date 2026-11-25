@@ -1128,10 +1128,77 @@ def _project_from_source_task(
     return project_obj, project_repo
 
 
-def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str]]:
+def _validate_assignee_skills(assignee: str, skills: list[str]) -> None:
+    """Reject pinned skills that do not resolve (installed + enabled) for *assignee*.
+
+    Skipped when *assignee* is not a live on-disk profile or has no initialized
+    ``skills/`` directory (e.g., synthetic unit-test homes) or when skills are
+    globally disabled via ``HERMES_SKILLS_OFF``.
+    """
+    import difflib
+    from agent.safe_worker_policy import safe_worker_enabled
+    from agent.skill_commands import (
+        _disabled_skill_names,
+        build_preloaded_skills_prompt,
+        get_skill_commands,
+    )
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    if safe_worker_enabled() or os.environ.get("HERMES_SKILLS_OFF", "").strip().lower() in {"1", "true", "yes"}:
+        return
+    try:
+        profile_home = Path(resolve_profile_env(assignee))
+    except Exception:
+        return
+    if not (profile_home / "skills").is_dir():
+        return
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        _, _loaded, missing = build_preloaded_skills_prompt(skills)
+        if not missing:
+            return
+        disabled = _disabled_skill_names()
+        available = sorted({
+            str(info.get("name") or key.lstrip("/"))
+            for key, info in get_skill_commands().items()
+            if isinstance(info, dict)
+            and str(info.get("name") or key.lstrip("/")) not in disabled
+        })
+    finally:
+        reset_hermes_home_override(token)
+
+    if len(missing) == 1:
+        headline = f"card pins skill {missing[0]!r}, which {assignee} does not have"
+    else:
+        quoted = ", ".join(repr(m) for m in missing)
+        headline = f"card pins skills {quoted}, which {assignee} does not have"
+
+    suggestions: list[str] = []
+    for m in missing:
+        for match in difflib.get_close_matches(m, available, n=3, cutoff=0.45):
+            if match not in suggestions:
+                suggestions.append(match)
+    if suggestions:
+        hint = f"Did you mean: {', '.join(suggestions)}?"
+    elif available:
+        sample = available[:15]
+        suffix = f" (+{len(available) - len(sample)} more)" if len(available) > len(sample) else ""
+        hint = f"Resolvable skills for {assignee}: {', '.join(sample)}{suffix}"
+    else:
+        hint = f"{assignee} has no enabled skills installed."
+    raise ValueError(f"{headline}. {hint}")
+
+
+def _normalize_task_skills(
+    skills: Optional[Iterable[str]], *, assignee: Optional[str] = None,
+) -> Optional[list[str]]:
     """Strip/dedupe a skills list. Commas are refused (a comma-joined string must
     not land in one argv slot); toolset names are rejected all at once because
-    agents that confuse the two usually pass several."""
+    agents that confuse the two usually pass several. When *assignee* is given
+    and resolves to a live profile with an initialized ``skills/`` directory,
+    every pin is validated against that profile's installed and enabled skills."""
     if skills is None:
         return None
     cleaned: list[str] = []
@@ -1165,6 +1232,8 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
             "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
             "capabilities (e.g. `web`, `browser`, `terminal`)."
         )
+    if cleaned and assignee:
+        _validate_assignee_skills(assignee, cleaned)
     return cleaned
 
 
@@ -1234,7 +1303,7 @@ def create_task(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
     parents = tuple(p for p in parents if p)
-    skills_list = _normalize_task_skills(skills)
+    skills_list = _normalize_task_skills(skills, assignee=assignee)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -3110,6 +3179,7 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
 def edit_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, priority: Optional[int] = None,
+    skills: Optional[Iterable[str]] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
@@ -3119,7 +3189,8 @@ def edit_task(
         if value is not None
     ]
     with write_txn(conn):
-        status = _task_status(conn, task_id)
+        row = conn.execute("SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        status = row["status"] if row is not None else None
         if status is None or (result is not None and status != "done"):
             return False
         assignments = []
@@ -3128,6 +3199,11 @@ def edit_task(
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)
+        if skills is not None:
+            skills_list = _normalize_task_skills(skills, assignee=row["assignee"])
+            assignments.append("skills = ?")
+            params.append(json.dumps(skills_list) if skills_list else None)
+            changed_fields.append("skills")
         if result is not None:
             assignments.append("result = ?")
             params.append(result)

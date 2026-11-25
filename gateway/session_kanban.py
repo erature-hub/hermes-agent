@@ -423,11 +423,29 @@ def worker_exit_code(path, params):
 KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'is_bot': True}
 
 
+def _format_skills_unavailable(missing: list[str], profile: str) -> str:
+    """One-line diagnostic naming the unresolvable pin(s) and assignee."""
+    who = profile or 'assignee'
+    if len(missing) == 1:
+        return f"card pins skill {missing[0]!r}, which {who} does not have"
+    joined = ', '.join(repr(m) for m in missing)
+    return f"card pins skills {joined}, which {who} does not have"
+
+
 def _run_task_turns(agent, frame, history, context):
     from agent.skill_commands import build_preloaded_skills_prompt
     skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
     if missing and not loaded:
-        raise ValueError('kanban_skills_unavailable')
+        # Return a clean failed turn result instead of crashing the managed worker:
+        # the owner settles the admission as terminal, worker_result records the exact
+        # diagnostic and exit_code=1, and the dispatcher counts the failure against
+        # consecutive_failures instead of misclassifying an unknown receipt as infra loss.
+        return {
+            'completed': False,
+            'failed': True,
+            'failure_reason': 'kanban_skills_unavailable',
+            'final_response': _format_skills_unavailable(missing, context.get('profile') or ''),
+        }
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
 

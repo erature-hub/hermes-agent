@@ -944,6 +944,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 
 
+def _parse_edit_skills_flag(raw_skills: Optional[list[str]]) -> Optional[list[str]]:
+    """Expand repeatable/comma-separated ``--skills`` values; 'none'/'' clears pins."""
+    if raw_skills is None:
+        return None
+    expanded: list[str] = []
+    for item in raw_skills:
+        for part in str(item).split(","):
+            name = part.strip()
+            if name:
+                expanded.append(name)
+    if not expanded or (len(expanded) == 1 and expanded[0].casefold() == "none"):
+        return []
+    return expanded
+
+
 def _cmd_edit(args: argparse.Namespace) -> int:
     result = getattr(args, "result", None)
     raw_metadata = getattr(args, "metadata", None)
@@ -951,18 +966,22 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    skills = _parse_edit_skills_flag(getattr(args, "skills", None))
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if all(value is None for value in (title, body, priority, skills, result)):
+        return _err("kanban edit: provide --title, --body, --priority, --skills, or --result", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
     with kbc.connect_closing() as conn:
-        ok = kb.edit_task(
-            conn, args.task_id, title=title, body=body, priority=priority,
-            result=result, summary=summary, metadata=metadata,
-        )
+        try:
+            ok = kb.edit_task(
+                conn, args.task_id, title=title, body=body, priority=priority,
+                skills=skills, result=result, summary=summary, metadata=metadata,
+            )
+        except ValueError as exc:
+            return _err(f"kanban edit: {exc}", 2)
     return _ok_or_err(
         ok,
         f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",

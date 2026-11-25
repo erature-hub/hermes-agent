@@ -182,13 +182,19 @@ async def _settle(client, claim, receipt):
 
 def _exit_code(receipt, params, board_db, waited_s=None):
     from hermes_cli.gateway_client import GatewayClientError
+    from gateway.session_kanban import worker_result
+    result = worker_result(board_db, params)
     if receipt['status'] == 'unknown':
+        # If the attempt already recorded an explicit diagnostic result (e.g., unresolvable
+        # pinned skills) before the receipt settled unknown, surface that real reason instead
+        # of collapsing it into the generic owner-unknown message.
+        if result.get('last_output'):
+            print(result['last_output'])
+            return result.get('exit_code', 1)
         # Name the wait this attempt actually paid. The board quotes the worker's last
         # output verbatim, so "which deadline it missed" has to be in these words (#t_853294b3).
         detail = f' after {waited_s:.0f}s' if waited_s else ''
         raise GatewayClientError(f'Kanban execution unknown; retained by owner{detail}')
-    from gateway.session_kanban import worker_result
-    result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
         print(result['last_output'])
