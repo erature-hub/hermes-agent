@@ -654,44 +654,32 @@ def heartbeat_worker(
 
 
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
-    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
+    """Terminate workers whose effective runtime bound has elapsed.
 
-    SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
-    task's source phase so the next tick re-spawns the same kind of worker —
-    unless the circuit breaker already gave up, leaving it blocked. Host-local
-    only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+    The bound is the card's own ``max_runtime_seconds`` when it has one, else the
+    fleet-wide ``kanban.max_runtime_seconds`` default, so a card claimed without an
+    explicit cap cannot hold a worker slot for an unbounded stretch of time.
+    SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the task's
+    source phase so the next tick re-spawns the same kind of worker — unless the
+    circuit breaker already gave up, leaving it blocked. Host-local only (same
+    reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
     """
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = _kb._host_prefix()
 
-    rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
-        "FROM tasks t "
-        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
-        "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
-    ).fetchall()
     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
-    for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
+    for attempt in _kmr.attempts_over_bound(conn, now=now):
+        if owner_reclaim_blocked(conn, attempt.id):
             continue
-        lock = row["claim_lock"] or ""
+        lock = attempt.claim_lock or ""
         if not lock.startswith(host_prefix):
             continue
-        # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
-        # so retries must be measured from the active task_runs row.
-        elapsed = now - (_kb._to_epoch(row["active_started_at"]) or now)  # unreadable clock: never kill
-        limit = int(row["max_runtime_seconds"])
-        if elapsed < limit:
-            continue
-
-        pid = int(row["worker_pid"])
-        tid = row["id"]
-        started_at = _kb._row_get(row, "worker_started_at")
+        pid = attempt.worker_pid
+        tid = attempt.id
+        started_at = attempt.worker_started_at
+        elapsed = attempt.elapsed_seconds
+        limit = attempt.limit_seconds
         if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
             # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
@@ -724,7 +712,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                (retry_status, tid, pid, attempt.claim_lock),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -3045,3 +3033,4 @@ from hermes_cli import kanban_pacer_bridge as _kpb
 # order the ticks it observes.
 _pacer_tick_indexes: dict[str, int] = {}
 _pacer_index_lock = threading.Lock()
+from hermes_cli import kanban_max_runtime as _kmr
