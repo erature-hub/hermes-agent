@@ -807,6 +807,80 @@ def _rule_stale_running(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _active_attempt_started_at(task, runs) -> Optional[int]:
+    """The epoch start of a card's active attempt: the current run's, else the card's."""
+    from hermes_cli import kanban_db as kb
+
+    run_id = _task_field(task, "current_run_id", None)
+    if run_id is not None:
+        for run in runs or ():
+            if _task_field(run, "id", None) == run_id:
+                started = kb._to_epoch(_task_field(run, "started_at", None))
+                if started is not None:
+                    return started
+    return kb._to_epoch(_task_field(task, "started_at", None))
+
+
+def _rule_over_max_runtime(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``running`` card whose attempt is past the runtime bound in force for it.
+
+    The bound is the card's own ``max_runtime_seconds`` when it has one, else the
+    fleet-wide ``kanban.max_runtime_seconds`` default. The dispatcher reclaims an
+    over-bound attempt on its next tick and books it ``timed_out``, so what an
+    operator sees here is the card that reclaim could NOT free: a foreign host's
+    claim, or an owner receipt that never resolved. Either way it is still holding
+    a worker slot past the bound it was given, and every card queued behind it
+    waits on that slot. Read-only.
+    """
+    if _task_field(task, "status") != "running":
+        return []
+    from hermes_cli import kanban_max_runtime as kmr
+
+    # The bound is per attempt: a card with no active attempt has nothing to measure.
+    if _task_field(task, "current_run_id", None) is None:
+        return []
+    fleet_limit = kmr.resolve_max_runtime_seconds(
+        (cfg.get("kanban") or {}).get("max_runtime_seconds"))
+    own_limit = _task_field(task, "max_runtime_seconds", None)
+    limit = kmr.effective_max_runtime_seconds(own_limit, fleet_limit)
+    if limit is None:
+        return []
+    started = _active_attempt_started_at(task, runs)
+    if started is None:
+        return []
+    elapsed = now - started
+    if elapsed < limit:
+        return []
+
+    age_str = (f"{elapsed / 3600:.1f}h" if elapsed >= 3600 else f"{int(elapsed / 60)}m")
+    # Escalate with the overrun: <2x the bound warning, 2x-6x error, >6x critical.
+    if elapsed >= limit * 6:
+        severity = "critical"
+    elif elapsed >= limit * 2:
+        severity = "error"
+    else:
+        severity = "warning"
+
+    source = ("the card's own --max-runtime" if own_limit is not None
+              else "the fleet-wide kanban.max_runtime_seconds default")
+    task_id = str(_task_field(task, "id") or "")
+    return [Diagnostic(
+        kind="over_max_runtime", severity=severity,
+        title=f"Running {age_str} past its {limit}s runtime bound",
+        detail=f"This attempt has been running {age_str} against the {limit}s bound in force for it "
+               f"({source}). The dispatcher reclaims an over-bound attempt on its next tick and books "
+               f"it timed_out, so a card still here is one that reclaim could not free — a foreign "
+               f"host's claim, or an owner receipt that never resolved. It is holding a worker slot "
+               f"that the cards queued behind it need. Check the card's log, then reclaim it or raise "
+               f"the bound.",
+        actions=[DiagnosticAction(kind="reclaim", label="Reclaim the overrunning card", suggested=True),
+                 _cli_hint("Reclaim from the CLI", f"hermes kanban reclaim {task_id}")],
+        first_seen_at=started, last_seen_at=started, count=1,
+        data={"elapsed_seconds": int(elapsed), "limit_seconds": int(limit),
+              "started_at": started, "max_runtime_seconds": own_limit},
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -820,6 +894,7 @@ _RULES: list[RuleFn] = [
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
     _rule_stale_running,
+    _rule_over_max_runtime,
 ]
 
 
